@@ -191,12 +191,52 @@ bool Engine::tunnel_alive(const Slot& slot, std::string& err) {
 
 bool Engine::wait_handshake(Slot& slot, const std::function<void(const std::string&)>& progress,
                             std::string& err) {
-    // Poll the kernel log for the handshake lines. Boot (model download ~16GB
-    // cached + load) can take many minutes; allow up to 25.
+    // Primary: live SSE log stream (works while the kernel runs).
+    // Fallback: ListKernelSessionOutput log (works after completion / for cached logs).
     KaggleClient client(slot.token);
     const int64_t deadline_ms = now_epoch_ms() + 25LL * 60 * 1000;
-    std::string stage;
+
+    auto try_extract = [&](const std::string& log, Slot& out) -> bool {
+        size_t tp = log.find("SHUGGLE_TUNNEL=");
+        size_t kp = log.find("SHUGGLE_KEY=");
+        if (tp == std::string::npos || kp == std::string::npos) return false;
+        size_t te = log.find('\n', tp);
+        size_t ke = log.find('\n', kp);
+        std::string tunnel =
+            trim(log.substr(tp + 15, te == std::string::npos ? std::string::npos : te - (tp + 15)));
+        std::string key =
+            trim(log.substr(kp + 12, ke == std::string::npos ? std::string::npos : ke - (kp + 12)));
+        double cpt = 3.2;
+        int ctx = 0;
+        // last SHUGGLE_META with phase=ready
+        size_t mp = log.find("SHUGGLE_META ");
+        while (mp != std::string::npos) {
+            size_t me = log.find('\n', mp);
+            std::string mj =
+                trim(log.substr(mp + 14, me == std::string::npos ? std::string::npos : me - (mp + 14)));
+            try {
+                json meta = json::parse(mj);
+                if (meta.value("phase", "") == "ready") {
+                    cpt = meta.value("chars_per_token", 3.2);
+                    ctx = meta.value("ctx", 0);
+                    break;
+                }
+            } catch (...) {
+            }
+            mp = log.find("SHUGGLE_META ", mp + 14);
+        }
+        std::lock_guard<std::mutex> lk(mu_);
+        slots_[out.token].tunnel_url = tunnel;
+        slots_[out.token].access_key = key;
+        slots_[out.token].chars_per_token = cpt;
+        slots_[out.token].ctx = ctx;
+        slots_[out.token].ready = true;
+        (void)out;
+        return true;
+    };
+
     while (now_epoch_ms() < deadline_ms) {
+        // status first — fail fast on kernel errors
         std::string serr;
         KernelStatus st = client.kernel_status(slot.username, slot.slug, serr);
         if (st.status == "ERROR") {
@@ -205,67 +245,78 @@ bool Engine::wait_handshake(Slot& slot, const std::function<void(const std::stri
             return false;
         }
         if (st.status == "COMPLETE") {
+            // script exited: pull the full persisted log via the regular endpoint
+            std::string log, lerr;
+            if (client.kernel_log(slot.username, slot.slug, log, lerr) &&
+                try_extract(log, slot))
+                return true;
             err = "notebook exited unexpectedly (crash or watchdog).";
             return false;
         }
+
+        // 1) cheap attempt: persisted log (some session states serve it live)
         std::string log, lerr;
-        bool got = client.kernel_log(slot.username, slot.slug, log, lerr);
-        if (got && !log.empty()) {
-            size_t tp = log.find("SHUGGLE_TUNNEL=");
-            size_t kp = log.find("SHUGGLE_KEY=");
-            if (tp != std::string::npos && kp != std::string::npos) {
-                size_t te = log.find('\n', tp);
-                size_t ke = log.find('\n', kp);
-                std::string tunnel =
-                    trim(log.substr(tp + 15, te == std::string::npos ? std::string::npos
-                                                                     : te - (tp + 15)));
-                std::string key =
-                    trim(log.substr(kp + 12, ke == std::string::npos ? std::string::npos
-                                                                     : ke - (kp + 12)));
-                double cpt = 3.2;
-                int ctx = 0;
-                size_t mp = log.find("SHUGGLE_META ");
-                while (mp != std::string::npos) {
-                    size_t me = log.find('\n', mp);
-                    std::string mj =
-                        trim(log.substr(mp + 14, me == std::string::npos ? std::string::npos
-                                                                         : me - (mp + 14)));
-                    try {
-                        json meta = json::parse(mj);
-                        if (meta.value("phase", "") == "ready") {
-                            cpt = meta.value("chars_per_token", 3.2);
-                            ctx = meta.value("ctx", 0);
-                            break;
+        if (client.kernel_log(slot.username, slot.slug, log, lerr) && !log.empty() &&
+            try_extract(log, slot))
+            return true;
+
+        // 2) live SSE stream until handshake lines arrive or the pass drops
+        HttpOptions sse_opts;
+        sse_opts.headers.push_back("Authorization: Bearer " + slot.token);
+        sse_opts.headers.push_back("Accept: text/event-stream");
+        sse_opts.connect_timeout_seconds = 20;
+        std::string sse_url = "https://www.kaggle.com/api/v1/kernels/logs/stream/" +
+                              slot.username + "/" + slot.slug;
+        std::string collected;
+        std::atomic<bool> found{false};
+        std::string stage;
+        long rc = Http::stream_get(
+            sse_url, sse_opts,
+            [&](const std::string& line) {
+                if (found) return;
+                // SSE frame: "data: {json}"
+                if (!starts_with(line, "data: ")) return;
+                std::string payload = trim(line.substr(6));
+                if (payload == "END_OF_LOG") {
+                    found = true;  // stream over; loop will retry via fallback
+                    return;
+                }
+                try {
+                    json ev = json::parse(payload);
+                    std::string data = ev.value("data", "");
+                    collected += data;
+                    if (progress) {
+                        if (data.find("downloading model") != std::string::npos &&
+                            stage != "downloading model") {
+                            stage = "downloading model (~16GB, cached after first run)";
+                            progress(stage);
+                        } else if (data.find("loading model") != std::string::npos &&
+                                   stage != "loading model") {
+                            stage = "loading model onto T4 x2";
+                            progress(stage);
+                        } else if (data.find("engine ready") != std::string::npos &&
+                                   stage != "engine ready") {
+                            stage = "engine ready";
+                            progress(stage);
                         }
-                    } catch (...) {
                     }
-                    mp = log.find("SHUGGLE_META ", mp + 14);
+                    if (data.find("SHUGGLE_TUNNEL=") != std::string::npos &&
+                        data.find("SHUGGLE_KEY=") != std::string::npos) {
+                        // not necessarily same chunk; keep buffering until both present
+                    }
+                    if (collected.find("SHUGGLE_TUNNEL=") != std::string::npos &&
+                        collected.find("SHUGGLE_KEY=") != std::string::npos) {
+                        found = true;
+                    }
+                } catch (...) {
                 }
-                std::lock_guard<std::mutex> lk(mu_);
-                slots_[slot.token].tunnel_url = tunnel;
-                slots_[slot.token].access_key = key;
-                slots_[slot.token].chars_per_token = cpt;
-                slots_[slot.token].ctx = ctx;
-                slots_[slot.token].ready = true;
-                return true;
-            }
-            if (progress) {
-                std::string new_stage = stage;
-                if (log.find("downloading model") != std::string::npos)
-                    new_stage = "downloading model (~16GB, cached after first run)";
-                else if (log.find("loading model") != std::string::npos)
-                    new_stage = "loading model onto T4 x2";
-                else if (log.find("engine ready") != std::string::npos)
-                    new_stage = "engine ready";
-                if (new_stage != stage) {
-                    stage = new_stage;
-                    progress(stage);
-                }
-            }
-        } else if (progress && !stage.empty() == false && st.status == "QUEUED") {
-            progress("queued on Kaggle");
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+            },
+            [&]() { return !found; });
+
+        if (found && try_extract(collected, slot)) return true;
+        // stream dropped without handshake (restart/queue flip) — small backoff
+        if (rc == 0 && progress && stage.empty()) progress("waiting on Kaggle");
+        std::this_thread::sleep_for(std::chrono::seconds(4));
     }
     err = "timed out waiting for engine handshake (25 min)";
     return false;

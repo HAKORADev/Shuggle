@@ -162,22 +162,39 @@ HttpResponse Http::download(const std::string& url, const std::string& to_path,
     return resp;
 }
 
+namespace {
+struct StreamCtx {
+    std::string buf;
+    const std::function<void(const std::string&)>* on_line;
+    const std::function<bool()>* keep_going;
+};
+
+size_t stream_consume(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* c = static_cast<StreamCtx*>(userdata);
+    c->buf.append(ptr, size * nmemb);
+    size_t pos;
+    while ((pos = c->buf.find('\n')) != std::string::npos) {
+        std::string line = c->buf.substr(0, pos);
+        c->buf.erase(0, pos + 1);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        (*c->on_line)(line);
+    }
+    if (c->keep_going && !(*c->keep_going)()) return 0;  // abort transfer
+    return size * nmemb;
+}
+}  // namespace
+
 long Http::stream_lines(const std::string& url, const std::string& body,
                         const HttpOptions& opts,
                         const std::function<void(const std::string& line)>& on_line,
                         const std::function<bool()>& keep_going) {
     init();
-    struct Ctx {
-        std::string buf;
-        const std::function<void(const std::string&)>* on_line;
-        const std::function<bool()>* keep_going;
-        bool abort = false;
-    } ctx{ "", &on_line, &keep_going, false };
+    StreamCtx ctx{ "", &on_line, &keep_going };
 
     CURL* curl = curl_easy_init();
     if (!curl) return 0;
     HttpOptions o = opts;
-    o.timeout_seconds = 0; // no total timeout for streams
+    o.timeout_seconds = 0;  // no total timeout for streams
     bool has_ct = false;
     for (auto& h : o.headers)
         if (starts_with(to_lower(h), "content-type:")) has_ct = true;
@@ -186,28 +203,37 @@ long Http::stream_lines(const std::string& url, const std::string& body,
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
-                     +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
-                         auto* c = static_cast<Ctx*>(userdata);
-                         c->buf.append(ptr, size * nmemb);
-                         size_t pos;
-                         while ((pos = c->buf.find('\n')) != std::string::npos) {
-                             std::string line = c->buf.substr(0, pos);
-                             c->buf.erase(0, pos + 1);
-                             if (!line.empty() && line.back() == '\r') line.pop_back();
-                             (*c->on_line)(line);
-                         }
-                         if (c->keep_going && !(*c->keep_going)()) return 0; // abort
-                         return size * nmemb;
-                     });
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_consume);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
     CURLcode rc = curl_easy_perform(curl);
     long status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     cleanup_slist(curl);
     curl_easy_cleanup(curl);
-    if (rc != CURLE_OK && rc != CURLE_WRITE_ERROR) return 0; // WRITE_ERROR = clean abort
+    if (rc != CURLE_OK && rc != CURLE_WRITE_ERROR) return 0;  // WRITE_ERROR = clean abort
     return status;
 }
 
-} // namespace shuggle
+long Http::stream_get(const std::string& url, const HttpOptions& opts,
+                      const std::function<void(const std::string& line)>& on_line,
+                      const std::function<bool()>& keep_going) {
+    init();
+    StreamCtx ctx{ "", &on_line, &keep_going };
+    CURL* curl = curl_easy_init();
+    if (!curl) return 0;
+    HttpOptions o = opts;
+    o.timeout_seconds = 0;
+    setup_common(curl, url, o);
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_consume);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+    CURLcode rc = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    cleanup_slist(curl);
+    curl_easy_cleanup(curl);
+    if (rc != CURLE_OK && rc != CURLE_WRITE_ERROR) return 0;
+    return status;
+}
+
+}  // namespace shuggle

@@ -161,31 +161,75 @@ async def shuggle_search(req: dict):
     max_results = int(req.get("max_results") or 6)
     max_results = max(3, min(8, max_results))
     import requests as _rq
-    out = {}
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
+
+    def _clean(s):
+        s = re.sub(r"<[^>]+>", "", s)
+        import html as _h
+        return _h.unescape(s).strip()
+
+    def _ddg_url(href):
+        uddg = re.search(r"uddg=([^&]+)", href)
+        if uddg:
+            return urllib.request.unquote(uddg.group(1))
+        return ("https:" + href) if href.startswith("//") else href
+
+    def search_ddg_html(q):
+        r = _rq.post("https://html.duckduckgo.com/html/", data={"q": q, "kp": "-2", "kl": "wt-wt"}, headers=headers, timeout=20)
+        html = r.text
+        anchors = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.S)
+        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.S)
+        out = []
+        for i, (href, title) in enumerate(anchors[:max_results]):
+            out.append({"title": _clean(title), "url": _ddg_url(href),
+                        "snippet": _clean(snippets[i])[:500] if i < len(snippets) else ""})
+        return out
+
+    def search_ddg_lite(q):
+        r = _rq.post("https://lite.duckduckgo.com/lite/", data={"q": q, "kp": "-2"}, headers=headers, timeout=20)
+        html = r.text
+        anchors = re.findall(r"<a[^>]*href=\"([^\"]+)\"[^>]*class='result-link'[^>]*>(.*?)</a>", html, re.S)
+        if not anchors:
+            anchors = re.findall(r"<a[^>]*class='result-link'[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>", html, re.S)
+        snippets = re.findall(r"class='result-snippet'[^>]*>(.*?)</td>", html, re.S)
+        out = []
+        for i, (href, title) in enumerate(anchors[:max_results]):
+            out.append({"title": _clean(title), "url": _ddg_url(href),
+                        "snippet": _clean(snippets[i])[:500] if i < len(snippets) else ""})
+        return out
+
+    def search_bing(q):
+        r = _rq.get("https://www.bing.com/search", params={"q": q, "safesearch": "off"}, headers=headers, timeout=20)
+        html = r.text
+        blocks = re.split(r'class="b_algo"', html)[1:]
+        out = []
+        for blk in blocks[:max_results]:
+            m = re.search(r'<a[^>]*href="(http[^"]+)"[^>]*>(.*?)</a>', blk, re.S)
+            if not m:
+                continue
+            out.append({"title": _clean(m.group(2)), "url": m.group(1), "snippet": ""})
+        return out
+
+    BACKENDS = [("ddg-html", search_ddg_html), ("ddg-lite", search_ddg_lite), ("bing", search_bing)]
+    out = {}
     for q in queries:
         results = []
-        try:
-            r = _rq.post("https://html.duckduckgo.com/html/", data={"q": q, "kp": "-2", "kl": "wt-wt"},
-                         headers=headers, timeout=20)
-            html = r.text
-            anchors = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.S)
-            snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.S)
-            def clean(s):
-                s = re.sub(r"<[^>]+>", "", s)
-                import html as _h
-                return _h.unescape(s).strip()
-            for i, (href, title) in enumerate(anchors[:max_results]):
-                uddg = re.search(r"uddg=([^&]+)", href)
-                real = urllib.request.unquote(uddg.group(1)) if uddg else ("https:" + href if href.startswith("//") else href)
-                snip = clean(snippets[i]) if i < len(snippets) else ""
-                results.append({"title": clean(title), "url": real, "snippet": snip[:500]})
-        except Exception as e:
-            out[q] = {"error": str(e)[:200], "results": []}
+        used = None
+        for name, fn in BACKENDS:
+            try:
+                results = fn(q)
+                if results:
+                    used = name
+                    break
+            except Exception:
+                results = []
+                continue
             time.sleep(1.0)
-            continue
-        out[q] = {"results": results}
-        time.sleep(1.2)   # be polite to the engine
+        if not results:
+            out[q] = {"error": "all search backends failed", "results": []}
+        else:
+            out[q] = {"backend": used, "results": results}
+        time.sleep(1.0)
     return {"results": out}
 
 # track every completion request as user activity
@@ -282,16 +326,16 @@ while True:
         stop_everything("idle %.0fs > %ds" % (idle, limit))
 )py";
 
-    // inject config right after the header comment (replaces the placeholder line)
+    // Inject config right before the imports (the template references SHUGGLE
+    // from the first boot line onward).
     std::string out = script;
-    const std::string marker = "SHUGGLE = {\n";
-    size_t pos = out.find(marker);
+    const std::string import_marker = "import json, os, re,";
+    size_t pos = out.find(import_marker);
     if (pos != std::string::npos) {
-        // find the end of the placeholder block "}" line
-        size_t end = out.find("\n}\n", pos);
-        if (end != std::string::npos) {
-            out = out.substr(0, pos) + cfg + out.substr(end + 3);
-        }
+        out = out.substr(0, pos) + "# ── generated config (baked by the app) ──\n" + cfg +
+              "\n" + out.substr(pos);
+    } else {
+        out = cfg + "\n" + script;  // never expected, but stay safe
     }
     return out;
 }

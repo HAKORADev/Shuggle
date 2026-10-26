@@ -44,6 +44,11 @@ public:
                              const HttpOptions& opts,
                              const std::function<void(const std::string& line)>& on_line,
                              const std::function<bool()>& keep_going);
+
+    // GET-based streaming (Kaggle kernel log SSE). Same semantics as stream_lines.
+    static long stream_get(const std::string& url, const HttpOptions& opts,
+                           const std::function<void(const std::string& line)>& on_line,
+                           const std::function<bool()>& keep_going);
 };
 
 } // namespace shuggle

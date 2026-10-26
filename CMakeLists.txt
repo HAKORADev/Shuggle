@@ -109,4 +109,8 @@ if(SHUGGLE_BUILD_GUI)
     endif()
 endif()
 
+# template syntax test (dev)
+add_executable(template_test tests/template_test.cpp)
+target_link_libraries(template_test PRIVATE shuggle_core)
+
 install(TARGETS shuggle-cli RUNTIME DESTINATION .)
