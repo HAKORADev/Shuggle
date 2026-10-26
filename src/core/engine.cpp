@@ -2,6 +2,7 @@
 #include "engine.h"
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 #include "util.h"
@@ -15,6 +16,9 @@ namespace {
 struct ThinkSplitter {
     std::string pending;
     bool in_think = false;
+    bool implicit_open = false;  // Qwen3 template: <think> lives in the prompt,
+                                 // generation starts INSIDE the think block
+    bool saw_close = false;
     EngineCallbacks cb;
 
     static bool is_open_prefix(const std::string& tail) {
@@ -39,6 +43,7 @@ struct ThinkSplitter {
                     emit_thinking(pending.substr(0, close));
                     pending.erase(0, close + 8);
                     in_think = false;
+                    saw_close = true;
                     continue;
                 }
                 if (is_close_prefix(pending)) return;  // hold partial closing tag
@@ -63,9 +68,16 @@ struct ThinkSplitter {
         }
     }
 
+    void begin() {
+        if (implicit_open) in_think = true;  // assume generation starts inside <think>
+    }
+
     void finish() {
         if (!pending.empty()) {
-            if (in_think) emit_thinking(pending);
+            // implicit-open with NO closing tag means the model never thought:
+            // everything buffered is ordinary content
+            if (implicit_open && !saw_close) emit_content(pending);
+            else if (in_think) emit_thinking(pending);
             else emit_content(pending);
             pending.clear();
         }
@@ -84,14 +96,23 @@ struct ThinkSplitter {
 
 std::string strip_think_blocks(const std::string& s) {
     size_t a = s.find("<think>");
-    if (a == std::string::npos) return s;
+    if (a == std::string::npos) {
+        // implicit-open form: generation started inside <think>; only the close exists
+        size_t c = s.find("</think>");
+        if (c != std::string::npos) return trim(s.substr(c + 8));
+        return s;
+    }
     size_t b = s.find("</think>", a);
     if (b == std::string::npos) return trim(s.substr(0, a));
     return trim(s.substr(0, a) + " " + s.substr(b + 8));
 }
 std::string extract_think_blocks(const std::string& s) {
     size_t a = s.find("<think>");
-    if (a == std::string::npos) return "";
+    if (a == std::string::npos) {
+        size_t c = s.find("</think>");
+        if (c != std::string::npos) return s.substr(0, c);  // implicit-open form
+        return "";
+    }
     size_t b = s.find("</think>", a);
     if (b == std::string::npos) return s.substr(a + 7);
     return s.substr(a + 7, b - a - 7);
@@ -496,38 +517,67 @@ ChatReply Engine::stream_reply(Session& s, const Session& context_source,
     std::atomic<bool> aborted{false};
     ThinkSplitter splitter;
     splitter.cb = cb;
+    splitter.implicit_open = m.thinking_enabled;  // Qwen3: generation starts inside <think>
+    splitter.begin();
 
     std::string url = slot.tunnel_url;
     while (!url.empty() && url.back() == '/') url.pop_back();
 
-    long status = Http::stream_lines(
-        url + "/v1/chat/completions", body, opts,
-        [&](const std::string& line) {
-            if (aborted) return;
-            if (!starts_with(line, "data: ")) return;
-            std::string data = trim(line.substr(6));
-            if (data == "[DONE]") return;
-            try {
-                json j = json::parse(data);
-                const auto& choices = j["choices"];
-                if (choices.empty()) return;
-                const auto& delta = choices[0].value("delta", json::object());
-                if (delta.contains("content") && !delta["content"].is_null()) {
-                    std::string piece = delta["content"].get<std::string>();
-                    std::lock_guard<std::mutex> lk(out_mu);
-                    content_all += piece;
-                    splitter.feed(piece);
+    // two attempts: quick cloudflared tunnels occasionally flap right after boot
+    long status = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        status = Http::stream_lines(
+            url + "/v1/chat/completions", body, opts,
+            [&](const std::string& line) {
+                if (aborted) return;
+                if (!starts_with(line, "data: ")) return;
+                std::string data = trim(line.substr(6));
+                if (data == "[DONE]") return;
+                try {
+                    json j = json::parse(data);
+                    const auto& choices = j["choices"];
+                    if (choices.empty()) return;
+                    const auto& delta = choices[0].value("delta", json::object());
+                    if (delta.contains("content") && !delta["content"].is_null()) {
+                        std::string piece = delta["content"].get<std::string>();
+                        std::lock_guard<std::mutex> lk(out_mu);
+                        content_all += piece;
+                        splitter.feed(piece);
+                    }
+                    if (delta.contains("reasoning_content") && !delta["reasoning_content"].is_null()) {
+                        std::string th = delta["reasoning_content"].get<std::string>();
+                        std::lock_guard<std::mutex> lk(out_mu);
+                        reasoning_all += th;
+                        if (cb.on_thinking) cb.on_thinking(th);
+                    }
+                } catch (...) {
                 }
-                if (delta.contains("reasoning_content") && !delta["reasoning_content"].is_null()) {
-                    std::string th = delta["reasoning_content"].get<std::string>();
-                    std::lock_guard<std::mutex> lk(out_mu);
-                    reasoning_all += th;
-                    if (cb.on_thinking) cb.on_thinking(th);
+            },
+            [&]() { return !aborted && (!cb.keep_going || cb.keep_going()); });
+        if (status != 0 || !content_all.empty()) break;
+        if (attempt == 0) {
+            if (cb.on_stage) cb.on_stage("tunnel flapped — retrying");
+            std::this_thread::sleep_for(std::chrono::seconds(8));
+            // refresh handshake in case the tunnel moved
+            Slot fresh = this->slot(kgat);
+            if (!fresh.tunnel_url.empty()) {
+                std::string terr;
+                if (!tunnel_alive(fresh, terr)) {
+                    // tunnel really died; re-handshake quickly via log
+                    fresh.ready = false;
+                    std::string aerr;
+                    wait_handshake(fresh, nullptr, aerr, 10);
+                    Slot re = this->slot(kgat);
+                    if (!re.tunnel_url.empty()) {
+                        url = re.tunnel_url;
+                        opts.headers.clear();
+                        opts.headers.push_back("X-Shuggle-Key: " + re.access_key);
+                        opts.headers.push_back("Accept: text/event-stream");
+                    }
                 }
-            } catch (...) {
             }
-        },
-        [&]() { return !aborted && (!cb.keep_going || cb.keep_going()); });
+        }
+    }
 
     splitter.finish();
     out.elapsed_ms = (int)(now_epoch_ms() - t0);

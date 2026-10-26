@@ -8,6 +8,13 @@
 #include <mutex>
 #include <thread>
 
+#ifdef _WIN32
+#include <io.h>
+#include <winsock2.h>
+#else
+#include <unistd.h>
+#endif
+
 #include "../common/banner.h"
 #include "../common/version.h"
 #include "../core/chat_store.h"
@@ -164,8 +171,9 @@ static int cmd_oneline(App& app, const std::vector<std::string>& args) {
         fflush(stdout);
     };
     cb.keep_going = [] { return true; };
-
+    app.engine->set_user_active(true);  // a user just typed — keep the notebook warm
     ChatReply r = app.engine->chat(s, text, {}, cb);
+    app.engine->set_user_active(false);
     printf("\n");
     if (!r.error.empty()) print_err(r.error);
     else {

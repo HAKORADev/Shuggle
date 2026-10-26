@@ -16,6 +16,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <direct.h>
 #else
 #include <dirent.h>
 #include <unistd.h>
@@ -245,8 +246,10 @@ bool ensure_dir(const std::string& path) {
 #ifdef _WIN32
         // skip drive letters like C:
         if (cur.size() == 2 && cur[1] == ':') continue;
-#endif
+        ::_mkdir(cur.c_str());
+#else
         ::mkdir(cur.c_str(), 0755);
+#endif
     }
     return file_exists(path);
 }
