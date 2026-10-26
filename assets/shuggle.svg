@@ -1,0 +1,42 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="shuggleGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e23b3b"/>
+      <stop offset="0.38" stop-color="#8a5a34"/>
+      <stop offset="0.62" stop-color="#7a4fa0"/>
+      <stop offset="1" stop-color="#6d3fc4"/>
+    </linearGradient>
+    <linearGradient id="edgeGlow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff6b6b"/>
+      <stop offset="1" stop-color="#9d6bff"/>
+    </linearGradient>
+    <radialGradient id="bgGlow" cx="0.5" cy="0.42" r="0.75">
+      <stop offset="0" stop-color="#1b1226"/>
+      <stop offset="1" stop-color="#0d0d0d"/>
+    </radialGradient>
+    <pattern id="glitter" width="14" height="14" patternUnits="userSpaceOnUse">
+      <circle cx="3"  cy="4"  r="1.1" fill="#e8b06a" opacity="0.85"/>
+      <circle cx="10" cy="9"  r="0.8" fill="#f5d9a8" opacity="0.7"/>
+      <circle cx="6"  cy="12" r="0.9" fill="#c98f4e" opacity="0.6"/>
+      <circle cx="12" cy="2"  r="0.7" fill="#ffe9c9" opacity="0.8"/>
+    </pattern>
+    <clipPath id="glyphClip">
+      <path d="M256 92 L432 404 L80 404 Z"/>
+    </clipPath>
+  </defs>
+
+  <rect width="512" height="512" rx="104" fill="url(#bgGlow)"/>
+
+  <!-- nabla glyph: gradient body + glitter band -->
+  <path d="M256 92 L432 404 L80 404 Z" fill="url(#shuggleGrad)"/>
+  <g clip-path="url(#glyphClip)">
+    <rect x="0" y="248" width="512" height="92" fill="url(#glitter)" opacity="0.9"/>
+  </g>
+
+  <!-- inner cut (hollow nabla look, keeps it clean at 16px) -->
+  <path d="M256 168 L362 356 L150 356 Z" fill="#0d0d0d"/>
+
+  <!-- edge stroke -->
+  <path d="M256 92 L432 404 L80 404 Z" fill="none" stroke="url(#edgeGlow)"
+        stroke-width="10" stroke-linejoin="round" opacity="0.95"/>
+</svg>

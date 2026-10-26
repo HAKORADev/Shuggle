@@ -1,0 +1,8 @@
+build*/
+.cache/
+compile_commands.json
+*.user
+.DS_Store
+vcpkg_installed/
+out/
+shuggle-data/
