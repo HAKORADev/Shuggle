@@ -1,0 +1,78 @@
+name: Linux Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential ninja-build cmake pkg-config \
+            libcurl4-openssl-dev \
+            qt6-base-dev qt6-base-dev-tools \
+            libwebkit2gtk-4.1-dev \
+            patchelf
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSHUGGLE_BUILD_GUI=ON
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Stage artifact (single folder, IMDER-style)
+        run: |
+          mkdir -p stage/lib
+          cp build/shuggle stage/
+          cp build/shuggle-cli stage/
+          if [ -f build/shuggle-web ]; then cp build/shuggle-web stage/; fi
+          # bundle Qt + EGL + deps beside the binary; binary carries $ORIGIN/lib rpath
+          for bin in shuggle shuggle-cli; do
+            patchelf --set-rpath '$ORIGIN/lib' stage/$bin 2>/dev/null || true
+          done
+          ldd stage/shuggle | awk '{print $3}' | grep -E 'Qt6|libEGL|libGL' | sort -u | while read f; do
+            cp -L "$f" stage/lib/ 2>/dev/null || true
+          done
+          # Qt platform + plugins needed at runtime
+          mkdir -p stage/lib/plugins
+          cp -r /usr/lib/qt6/plugins/platforms stage/lib/plugins/ 2>/dev/null || \
+            cp -r /usr/lib/x86_64-linux-gnu/qt6/plugins/platforms stage/lib/plugins/ 2>/dev/null || true
+          cp -r /usr/lib/x86_64-linux-gnu/qt6/plugins/imageformats stage/lib/plugins/ 2>/dev/null || true
+          cp -r /usr/lib/x86_64-linux-gnu/qt6/plugins/iconengines stage/lib/plugins/ 2>/dev/null || true
+          # force plugin path relative
+          mkdir -p stage/bin
+          cat > stage/shuggle-launcher.sh << 'EOS'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"
+          export QT_PLUGIN_PATH="$DIR/lib/plugins"
+          exec "$DIR/shuggle" "$@"
+          EOS
+          chmod +x stage/shuggle-launcher.sh
+          cat > stage/README.txt << 'EOS'
+          Shuggle v0.5.0 (Linux)
+          ---------------------
+          Run:  ./shuggle-launcher.sh   (GUI)
+                ./shuggle-cli chat "hello"   (one-line)
+                ./shuggle-cli                (help)
+          EOS
+
+      - name: Smoke test (CLI + GUI offscreen)
+        run: |
+          ./build/shuggle-cli version
+          ./build/shuggle-cli | head -5
+          QT_QPA_PLATFORM=offscreen timeout 5 ./build/shuggle || code=$?
+          echo "gui exit: ${code:-0} (124 = ran until timeout, good)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shuggle-linux
+          path: stage/
