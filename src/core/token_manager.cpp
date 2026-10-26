@@ -169,7 +169,9 @@ const ManagedToken* TokenManager::auto_pick() const {
     std::lock_guard<std::mutex> lk(mu_);
     const ManagedToken* best = nullptr;
     for (const auto& mt : tokens_) {
-        if (mt.state != TokenState::READY) continue;
+        // READY and IN_USE are both usable — IN_USE just means this app already
+        // booted an engine on it (quota still applies)
+        if (mt.state != TokenState::READY && mt.state != TokenState::IN_USE) continue;
         if (!best) { best = &mt; continue; }
         double my_left = mt.quota.remaining_hours();
         double best_left = best->quota.remaining_hours();
@@ -177,7 +179,7 @@ const ManagedToken* TokenManager::auto_pick() const {
             (my_left == best_left && mt.last_checked < best->last_checked))
             best = &mt;
     }
-    return best; // points into tokens_ — caller must not free; safe under snapshot use
+    return best;  // points into tokens_ — caller must not free; safe under snapshot use
 }
 
 void TokenManager::mark_in_use(const std::string& kgat, bool in_use) {

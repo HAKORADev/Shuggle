@@ -98,7 +98,7 @@ private:
                            const std::vector<ContextPiece>& extra_system,
                            const std::string& appended_to_user, const EngineCallbacks& cb);
     bool wait_handshake(Slot& slot, const std::function<void(const std::string&)>& progress,
-                        std::string& err);
+                        std::string& err, int max_minutes = 25);
     bool tunnel_alive(const Slot& slot, std::string& err);
     void start_heartbeat_thread();
     std::string build_request_body(const Session& s, const Slot& slot,

@@ -69,22 +69,21 @@ std::vector<SearchResult> extract_results(const std::string& raw_json, std::stri
 
 std::string render_web_context_block(const SearchOutcome& oc) {
     std::string block;
-    block += "\n[web context — retrieved today via unfiltered search; may be incomplete]\n";
+    block += "\n[web context — already retrieved for you via unfiltered search; may be incomplete]\n";
     if (!oc.digest.empty()) {
         block += oc.digest + "\n";
     } else if (!oc.results.empty()) {
-        int per_query_budget = 400;
         int used = 0;
         for (const auto& r : oc.results) {
             if (used > 12) break;
             block += "- " + r.title + " (" + r.url + "): " + r.snippet + "\n";
             used++;
         }
-        (void)per_query_budget;
     } else {
         block += "(no usable results)\n";
     }
-    block += "[/web context]\n";
+    block += "Search has already been performed. Use the facts above; never emit "
+             "tool/function-call syntax in your reply.\n[/web context]\n";
     return block;
 }
 
@@ -95,12 +94,23 @@ SearchOutcome run_search_pipeline(const LlmCall& llm, const SearchBackend& backe
     if (max_queries < 1) max_queries = 1;
     if (max_queries > 5) max_queries = 5;
 
+    // strip thinking blocks from planner/digest outputs (Qwen3 style)
+    auto strip_think = [](std::string s) {
+        size_t a;
+        while ((a = s.find("<think>")) != std::string::npos) {
+            size_t b = s.find("</think>", a);
+            if (b == std::string::npos) { s.erase(0, a); break; }
+            s.erase(a, b + 8 - a);
+        }
+        return trim(s);
+    };
+
     // [1] planner
     json msgs = json::array();
     msgs.push_back({{"role", "system"}, {"content", search_planner_prompt(max_queries)}});
     msgs.push_back({{"role", "user"}, {"content", user_message}});
     std::string err;
-    std::string plan = llm(msgs.dump(), 150, err);
+    std::string plan = strip_think(llm(msgs.dump(), 200, err));
     if (!err.empty()) {
         oc.error = "planner: " + err;
         return oc;
@@ -109,18 +119,19 @@ SearchOutcome run_search_pipeline(const LlmCall& llm, const SearchBackend& backe
     try {
         size_t a = plan.find('[');
         size_t b = plan.rfind(']');
-        if (a == std::string::npos || b == std::string::npos || b <= a) throw std::runtime_error("no array");
+        if (a == std::string::npos || b == std::string::npos || b <= a)
+            throw std::runtime_error("no array");
         json arr = json::parse(plan.substr(a, b - a + 1));
         for (const auto& q : arr)
-            if (q.is_string() && !q.get<std::string>().empty()) oc.queries.push_back(q.get<std::string>());
+            if (q.is_string() && !q.get<std::string>().empty())
+                oc.queries.push_back(q.get<std::string>());
         if (oc.queries.size() > (size_t)max_queries) oc.queries.resize(max_queries);
-    } catch (const std::exception& e) {
-        oc.error = std::string("planner parse: ") + e.what();
-        return oc;
+    } catch (const std::exception&) {
+        // fallback: search the user's message directly (still better than failing)
+        oc.queries.push_back(user_message.substr(0, 120));
     }
     if (oc.queries.empty()) {
         oc.ok = true;  // planner says no search needed
-        oc.digest = "";
         return oc;
     }
 
@@ -151,7 +162,7 @@ SearchOutcome run_search_pipeline(const LlmCall& llm, const SearchBackend& backe
             raw_text += "## " + r.title + "\n" + r.url + "\n" + r.snippet + "\n\n";
         }
         dmsgs.push_back({{"role", "user"}, {"content", raw_text}});
-        std::string digest = llm(dmsgs.dump(), 600, err);
+        std::string digest = strip_think(llm(dmsgs.dump(), 700, err));
         if (err.empty() && !digest.empty()) {
             if (digest.find("NOTHING_USEFUL") == std::string::npos)
                 oc.digest = trim(digest);

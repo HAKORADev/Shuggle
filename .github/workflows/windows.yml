@@ -8,6 +8,8 @@ on:
 jobs:
   build-windows:
     runs-on: windows-2022
+    env:
+      VCPKG_ROOT: ${{ env.VCPKG_INSTALLATION_ROOT }}
     steps:
       - uses: actions/checkout@v4
 
@@ -18,7 +20,12 @@ jobs:
           host: windows
           target: desktop
           arch: win64_msvc2022_64
-          modules: ""
+
+      - name: Install curl via vcpkg (preinstalled on runners)
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install curl:x64-windows
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
 
       - name: Get WebView2 SDK (nuget)
         shell: pwsh
@@ -27,16 +34,18 @@ jobs:
           $url = "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2"
           Invoke-WebRequest -Uri $url -OutFile webview2\pkg.zip
           Expand-Archive -Path webview2\pkg.zip -DestinationPath webview2\pkg
-          echo "WEBVIEW2_DIR=$PWD\webview2\pkg" >> $env:GITHUB_ENV
+          echo "WEBVIEW2_INC=$PWD\webview2\pkg\build\native\include" >> $env:GITHUB_ENV
+          echo "WEBVIEW2_LIB=$PWD\webview2\pkg\build\native\x64" >> $env:GITHUB_ENV
 
-      - name: Configure (MSVC)
+      - name: Configure (MSVC + vcpkg toolchain)
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSHUGGLE_BUILD_GUI=ON ^
-            -DCMAKE_CXX_FLAGS="/permissive- /Zc:__cplusplus" ^
-            -DSHUGGLE_WEBVIEW2_INCLUDE="%WEBVIEW2_DIR%\build\native\include" ^
-            -DSHUGGLE_WEBVIEW2_LIB="%WEBVIEW2_DIR%\build\native\x64"
+            -DCMAKE_TOOLCHAIN_FILE="%VCPKG_INSTALLATION_ROOT%\scripts\buildsystems\vcpkg.cmake" ^
+            -DVCPKG_TARGET_TRIPLET=x64-windows ^
+            -DSHUGGLE_WEBVIEW2_INCLUDE="%WEBVIEW2_INC%" ^
+            -DSHUGGLE_WEBVIEW2_LIB="%WEBVIEW2_LIB%"
 
       - name: Build
         shell: cmd
@@ -44,17 +53,22 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           ninja -C build
 
-      - name: Stage artifact (windeployqt, single folder)
+      - name: Stage artifact (single folder)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path stage | Out-Null
           Copy-Item build\shuggle.exe stage\
           Copy-Item build\shuggle-cli.exe stage\
+          # Qt deployment
           windeployqt --no-translations --no-system-d3d-compiler --no-opengl-sw `
-            --exclude-plugins qmltooling,sceneparsers,position,sensors,webview `
+            --exclude-plugins qmltooling,sceneparsers,position,sensors `
             stage\shuggle.exe
-          Remove-Item stage\*.qml -ErrorAction SilentlyContinue
-          Get-ChildItem stage -Recurse -Include *.qml,*d.dll | Remove-Item -ErrorAction SilentlyContinue
+          # curl + deps from vcpkg
+          $vbin = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin"
+          Get-ChildItem $vbin -Filter *.dll | ForEach-Object {
+            Copy-Item $_.FullName stage\ -ErrorAction SilentlyContinue
+          }
+          Get-ChildItem stage -Recurse -Include *d.dll | Where-Object { $_.Name -match 'd\.dll$' -and $_.Name -notmatch 'Qt6' } | Remove-Item -ErrorAction SilentlyContinue
 
       - name: Smoke test (CLI)
         shell: pwsh

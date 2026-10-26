@@ -90,8 +90,12 @@ static void seed_token_from_env(App& app) {
     }
     if (!tok.empty() && !app.tokens->has_token(tok)) {
         std::string err;
-        if (app.tokens->add_token(tok, "auto", err)) print_ok("token added from env/file");
-        else print_err("token rejected: " + err);
+        if (app.tokens->add_token(tok, "auto", err)) {
+            app.tokens->save();
+            print_ok("token added from env/file");
+        } else {
+            print_err("token rejected: " + err);
+        }
     }
 }
 

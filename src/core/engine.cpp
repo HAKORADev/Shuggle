@@ -190,11 +190,11 @@ bool Engine::tunnel_alive(const Slot& slot, std::string& err) {
 }
 
 bool Engine::wait_handshake(Slot& slot, const std::function<void(const std::string&)>& progress,
-                            std::string& err) {
+                            std::string& err, int max_minutes) {
     // Primary: live SSE log stream (works while the kernel runs).
     // Fallback: ListKernelSessionOutput log (works after completion / for cached logs).
     KaggleClient client(slot.token);
-    const int64_t deadline_ms = now_epoch_ms() + 25LL * 60 * 1000;
+    const int64_t deadline_ms = now_epoch_ms() + (int64_t)max_minutes * 60 * 1000;
 
     auto try_extract = [&](const std::string& log, Slot& out) -> bool {
         size_t tp = log.find("SHUGGLE_TUNNEL=");
@@ -269,7 +269,7 @@ bool Engine::wait_handshake(Slot& slot, const std::function<void(const std::stri
                               slot.username + "/" + slot.slug;
         std::string collected;
         std::atomic<bool> found{false};
-        std::string stage;
+        std::string stage;  // note: intentionally per-pass; SSE restarts re-report stages
         long rc = Http::stream_get(
             sse_url, sse_opts,
             [&](const std::string& line) {
@@ -357,6 +357,24 @@ bool Engine::ensure_running(const std::string& kgat, const Session& s,
             slot.tunnel_url.clear();
         }
         slot.booting = true;
+    }
+    // REATTACH: if the kernel is already RUNNING (app restarted / previous
+    // session alive), try to adopt it instead of pushing a new version.
+    {
+        std::string serr0;
+        KernelStatus st0 = KaggleClient(kgat).kernel_status(slots_[kgat].username,
+                                                            slots_[kgat].slug, serr0);
+        if (st0.status == "RUNNING") {
+            Slot adopt = slots_[kgat];
+            std::string aerr;
+            if (wait_handshake(adopt, progress, aerr, 12)) {
+                tokens_.mark_in_use(kgat, true);
+                std::lock_guard<std::mutex> lk(mu_);
+                slots_[kgat].booting = false;
+                return true;
+            }
+            // not adoptable (early boot, no handshake yet) -> fall through to push
+        }
     }
     tokens_.mark_in_use(kgat, true);
     if (progress) progress("pushing notebook");
@@ -553,59 +571,71 @@ ChatReply Engine::stream_reply(Session& s, const Session& context_source,
 
 ChatReply Engine::chat(Session& s, const std::string& user_text,
                        std::vector<Attachment> attachments, const EngineCallbacks& cb) {
-    // 1. optional search pipeline BEFORE recording the user message (web context
-    //    rides with the user text into history)
+    // 0. resolve token + make sure the engine is up FIRST (search needs the tunnel)
+    std::string kgat0 = s.settings.token_override.value_or("");
+    if (kgat0.empty() || !tokens_.has_token(kgat0)) {
+        const ManagedToken* pick0 = tokens_.auto_pick();
+        if (!pick0) {
+            ChatReply r;
+            r.error = "no available token — all exhausted or invalid. Add tokens or wait "
+                      "for the weekly reset.";
+            return r;
+        }
+        kgat0 = pick0->token;
+        s.bound_token = kgat0;
+        s.bound_username = pick0->username;
+    }
+    std::string err0;
+    if (!ensure_running(kgat0, s, cb.on_stage, err0)) {
+        ChatReply r;
+        r.error = err0;
+        return r;
+    }
+
+    // 1. optional search pipeline (engine is live; tunnel available)
     std::string web_block;
     bool want_search = s.settings.effective_search(settings_.search_enabled_default);
     if (want_search) {
         if (cb.on_stage) cb.on_stage("searching");
-        std::string kgat = s.settings.token_override.value_or("");
-        if (kgat.empty()) {
-            const ManagedToken* pick = tokens_.auto_pick();
-            kgat = pick ? pick->token : "";
-        }
-        if (!kgat.empty()) {
-            Slot slot = this->slot(kgat);
-            if (slot.ready) {
-                SearchBackend backend = search_backend(kgat);
-                auto llm_call = [&](const std::string& messages_json, int max_tokens,
-                                    std::string& lerr) -> std::string {
-                    HttpOptions opts;
-                    opts.headers.push_back("X-Shuggle-Key: " + slot.access_key);
-                    opts.timeout_seconds = 240;
-                    json req = json::parse(messages_json);
-                    req["max_tokens"] = max_tokens;
-                    req["stream"] = false;
-                    std::string url = slot.tunnel_url;
-                    while (!url.empty() && url.back() == '/') url.pop_back();
-                    HttpResponse r =
-                        Http::post_json(url + "/v1/chat/completions", req.dump(), opts);
-                    if (!r.ok()) {
-                        lerr = "llm HTTP " + std::to_string(r.status);
-                        return "";
-                    }
-                    try {
-                        json j = json::parse(r.body);
-                        return j["choices"][0]["message"].value("content", "");
-                    } catch (const std::exception& e) {
-                        lerr = e.what();
-                        return "";
-                    }
-                };
-                SearchOutcome oc = run_search_pipeline(
-                    llm_call, backend, user_text, settings_.search_max_queries,
-                    settings_.search_digest);
-                if (oc.ok && (!oc.digest.empty() || !oc.results.empty()))
-                    web_block = render_web_context_block(oc);
-                else if (!oc.error.empty())
-                    web_block = "\n[web search failed: " + oc.error + "]\n";
+        Slot slot = this->slot(kgat0);
+        SearchBackend backend = search_backend(kgat0);
+        auto llm_call = [&](const std::string& messages_json, int max_tokens,
+                            std::string& lerr) -> std::string {
+            HttpOptions opts;
+            opts.headers.push_back("X-Shuggle-Key: " + slot.access_key);
+            opts.timeout_seconds = 240;
+            json req;
+            req["messages"] = json::parse(messages_json);
+            req["max_tokens"] = max_tokens;
+            req["stream"] = false;
+            std::string url = slot.tunnel_url;
+            while (!url.empty() && url.back() == '/') url.pop_back();
+            HttpResponse r = Http::post_json(url + "/v1/chat/completions", req.dump(), opts);
+            if (!r.ok()) {
+                lerr = "llm HTTP " + std::to_string(r.status);
+                return "";
             }
-        }
+            try {
+                json j = json::parse(r.body);
+                return j["choices"][0]["message"].value("content", "");
+            } catch (const std::exception& e) {
+                lerr = e.what();
+                return "";
+            }
+        };
+        SearchOutcome oc = run_search_pipeline(llm_call, backend, user_text,
+                                               settings_.search_max_queries,
+                                               settings_.search_digest);
+        if (oc.ok && (!oc.digest.empty() || !oc.results.empty()))
+            web_block = render_web_context_block(oc);
+        else if (!oc.error.empty())
+            web_block = "\n[web search failed: " + oc.error + "]\n";
     }
 
     // 2. record user message (so it's in the context we build next)
     ChatStore store(sessions_dir());
     std::string user_msg_id = store.add_user_message(s, user_text, std::move(attachments));
+    std::string search_note = web_note(web_block);
     store.save_session(s);
 
     // 3. memory tool prompt as its own system message
@@ -615,8 +645,15 @@ ChatReply Engine::chat(Session& s, const std::string& user_text,
 
     // 4. stream the reply under the user message
     ChatReply out = stream_reply(s, s, user_msg_id, extra_system, web_block, cb);
+    // attach the search note to the recorded assistant message
+    if (!search_note.empty()) {
+        auto it = s.messages.rbegin();
+        if (it != s.messages.rend() && it->second.role == "assistant")
+            it->second.search_note = search_note;
+        store.save_session(s);
+    }
 
-    // note: stream_reply already saved the session; sync best-effort
+    // sync best-effort
     if (settings_.kaggle_sync_enabled && out.error.empty()) {
         std::string serr;
         sync_session(s, serr);

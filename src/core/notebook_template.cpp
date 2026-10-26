@@ -68,10 +68,12 @@ def pip(*args):
     return r.returncode == 0
 
 slog("installing llama-cpp-python (prebuilt CUDA wheel)...")
-ok = pip("llama-cpp-python", "--extra-index-url", "https://abetlen.github.io/llama-cpp-python/whl/cu121")
+ok = pip("llama-cpp-python[server]", "--extra-index-url", "https://abetlen.github.io/llama-cpp-python/whl/cu121")
 if not ok:
     slog("cu121 wheel failed, trying default index...")
-    pip("llama-cpp-python")
+    pip("llama-cpp-python[server]")
+# server extras are sometimes skipped by the prebuilt wheels — force them
+pip("uvicorn", "fastapi", "sse-starlette", "starlette", "pydantic-settings")
 pip("huggingface_hub")
 slog("dependencies ready.")
 
