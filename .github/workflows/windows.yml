@@ -8,8 +8,6 @@ on:
 jobs:
   build-windows:
     runs-on: windows-2022
-    env:
-      VCPKG_ROOT: ${{ env.VCPKG_INSTALLATION_ROOT }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,7 +23,6 @@ jobs:
         shell: pwsh
         run: |
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install curl:x64-windows
-          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
 
       - name: Get WebView2 SDK (nuget)
         shell: pwsh
