@@ -13,7 +13,7 @@ namespace shuggle {
 
 // ── <think> stream splitter ─────────────────────────────────────────────────
 namespace {
-struct ThinkSplitter {
+struct StreamThinkSplitter {
     std::string pending;
     bool in_think = false;
     bool implicit_open = false;  // Qwen3 template: <think> lives in the prompt,
@@ -515,7 +515,7 @@ ChatReply Engine::stream_reply(Session& s, const Session& context_source,
     std::mutex out_mu;
     std::string content_all, reasoning_all;
     std::atomic<bool> aborted{false};
-    ThinkSplitter splitter;
+    StreamThinkSplitter splitter;
     splitter.cb = cb;
     splitter.implicit_open = m.thinking_enabled;  // Qwen3: generation starts inside <think>
     splitter.begin();
