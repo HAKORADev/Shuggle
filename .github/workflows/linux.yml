@@ -35,7 +35,7 @@ jobs:
           if [ -f build/shuggle-web ]; then cp build/shuggle-web stage/; fi
           # binaries carry $ORIGIN/lib rpath
           for bin in shuggle shuggle-cli; do
-            patchelf --set-rpath '\$ORIGIN/lib' stage/$bin 2>/dev/null || true
+            patchelf --set-rpath '$ORIGIN/lib' stage/$bin 2>/dev/null || true
           done
           # bundle the FULL ldd closure (minus glibc core) — no whitelist gaps
           bundle_deps() {
