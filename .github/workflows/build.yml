@@ -16,7 +16,7 @@ jobs:
       - name: Bundle UI
         run: bun build src/ui/app.ts --minify --format=iife --outfile=src/ui/app.bundle.js
       - name: Compile single binary
-        run: bun build src/shuggle.ts --compile --minify --bytecode --outfile=shuggle
+        run: bun build src/shuggle.ts --compile --outfile=shuggle
       - name: Smoke test
         run: |
           ./shuggle version
@@ -39,7 +39,7 @@ jobs:
         run: bun build src/ui/app.ts --minify --format=iife --outfile=src/ui/app.bundle.js
       - name: Compile single binary
         shell: bash
-        run: bun build src/shuggle.ts --compile --minify --bytecode --windows-icon=assets/shuggle.ico --windows-hide-console --windows-title="Shuggle" --windows-publisher="HAKORA" --windows-version="0.5.0.0" --windows-description="Free chats on free GPUs" --outfile=Shuggle.exe
+        run: bun build src/shuggle.ts --compile --windows-icon=assets/shuggle.ico --windows-hide-console --windows-title="Shuggle" --windows-publisher="HAKORA" --windows-version="0.5.0.0" --windows-description="Free chats on free GPUs" --outfile=Shuggle.exe
       - name: Smoke test
         shell: bash
         run: |

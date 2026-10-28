@@ -16,12 +16,14 @@ const app = {
   memory: "",
   engines: [] as any[],
   attachments: [] as { name: string; content: string }[],
+  media: [] as { name: string; kind: "image" | "video"; dataB64: string; size: number }[],
   compareOpen: false,
   compareId: null as string | null,
   compareFull: null as any,
   generating: new Set<string>(),
   sectionCollapse: { pinned: false, history: false } as Record<string, boolean>,
   sending: false,
+  visionToastShown: false,
 };
 
 // ------------------------------------------------------------------ utils
@@ -155,7 +157,7 @@ async function refreshApp(): Promise<void> {
   app.engines = full.engines;
   $("#gate").classList.add("hidden");
   $("#shell").classList.remove("hidden");
-  $("#foot-account").innerHTML = `<b>${esc(app.account)}</b><span>local device</span>`;
+  $("#foot-account").innerHTML = `<b>${esc(app.account ?? "")}</b><span>local device</span>`;
   renderChatList();
   renderEngineStates();
   if (!app.currentMeta && app.sessions.length) {
@@ -418,7 +420,11 @@ function renderMsg(node: any): HTMLElement {
     const contentHtml = renderMd(node.content);
     bubble.innerHTML = `<div class="md" dir="${isRtl(node.content) ? "rtl" : "ltr"}">${contentHtml}</div>`;
     for (const a of node.attachments ?? []) {
-      bubble.prepend(el("div", "attach-chip", `<b>${esc(a.name)}</b><span>${a.chars} chars</span>`));
+      if ((a as any).media) {
+        bubble.prepend(el("div", "attach-chip media", `<b>${esc(a.name)}</b><span>${(a as any).media === "video" ? "video" : "image"}</span>`));
+      } else {
+        bubble.prepend(el("div", "attach-chip", `<b>${esc(a.name)}</b><span>${a.chars} chars</span>`));
+      }
     }
     const acts = el("div", "actions");
     acts.appendChild(actionBtn("Copy", `<svg viewBox="0 0 24 24" width="13" height="13"><rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="2" fill="none"/><path d="M5 15V5a2 2 0 0 1 2-2h10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>`, () => navigator.clipboard.writeText(node.content)));
@@ -571,17 +577,19 @@ async function send(): Promise<void> {
   if (app.sending || !app.currentMeta) return;
   const input = $("#input") as HTMLTextAreaElement;
   const text = input.value.trim();
-  if (!text && app.attachments.length === 0) return;
+  if (!text && app.attachments.length === 0 && app.media.length === 0) return;
   app.sending = true;
   setSendState();
   try {
     const r = await api("POST", `/api/sessions/${app.currentMeta.id}/send`, {
       text,
       attachments: app.attachments,
+      media: app.media.map((m) => ({ name: m.name, kind: m.kind, dataB64: m.dataB64 })),
     });
     input.value = "";
     autosize();
     app.attachments = [];
+    app.media = [];
     renderAttachments();
     app.generating.add(app.currentMeta.id);
     await refreshSessions();
@@ -622,6 +630,12 @@ function autosize(): void {
 async function addFiles(files: FileList): Promise<void> {
   for (const f of Array.from(files)) {
     try {
+      const isImage = f.type.startsWith("image/");
+      const isVideo = f.type.startsWith("video/");
+      if (isImage || isVideo) {
+        await addMedia(f, isImage ? "image" : "video");
+        continue;
+      }
       const buf = await f.arrayBuffer();
       // strict UTF-8 validation
       const dec = new TextDecoder("utf-8", { fatal: true });
@@ -645,10 +659,50 @@ async function addFiles(files: FileList): Promise<void> {
   renderAttachments();
 }
 
+async function addMedia(f: File, kind: "image" | "video"): Promise<void> {
+  const v = app.settings?.vision ?? { enabled: false, maxImages: 4, imageMaxMB: 8, videoMaxMB: 30 };
+  if (!v.enabled) {
+    toast("Vision is off — turn it on in Settings → Model first.", "error");
+    return;
+  }
+  if (app.currentMeta && app.currentMeta.visionEnabled === false) {
+    toast("Vision is off for this chat — flip the Vision toggle above the chat.", "error");
+    return;
+  }
+  const capMB = kind === "video" ? v.videoMaxMB : v.imageMaxMB;
+  if (f.size > capMB * 1024 * 1024) {
+    toast(`"${f.name}" is ${(f.size / 1024 / 1024).toFixed(1)} MB — the limit for ${kind === "video" ? "videos" : "images"} is ${capMB} MB.`, "error");
+    return;
+  }
+  const total = app.media.length + 1;
+  if (total > v.maxImages) {
+    toast(`Up to ${v.maxImages} images/videos per message.`, "error");
+    return;
+  }
+  const buf = new Uint8Array(await f.arrayBuffer());
+  let bin = "";
+  const CH = 0x8000;
+  for (let i = 0; i < buf.length; i += CH) {
+    bin += String.fromCharCode.apply(null, Array.from(buf.subarray(i, i + CH)) as any);
+  }
+  app.media.push({ name: f.name, kind, dataB64: btoa(bin), size: f.size });
+}
+
 function renderAttachments(): void {
   const row = $("#attach-row");
   row.innerHTML = "";
-  row.classList.toggle("hidden", app.attachments.length === 0);
+  const has = app.attachments.length + app.media.length;
+  row.classList.toggle("hidden", has === 0);
+  app.media.forEach((m, i) => {
+    const chip = el("div", "attach-chip media", `<b>${esc(m.name)}</b><span>${m.kind === "video" ? "video" : "image"} · ${(m.size / 1024 / 1024).toFixed(1)} MB</span>`);
+    const x = el("button", "icon-btn", "×");
+    x.onclick = () => {
+      app.media.splice(i, 1);
+      renderAttachments();
+    };
+    chip.appendChild(x);
+    row.appendChild(chip);
+  });
   app.attachments.forEach((a, i) => {
     const chip = el("div", "attach-chip", `<b>${esc(a.name)}</b><span>${a.content.length} chars</span>`);
     const x = el("button", "icon-btn", "×");
@@ -753,6 +807,26 @@ function connectStream(): void {
           await openSession(data.sid);
         }
         break;
+      case "memory-chip": {
+        if (data.sid === app.currentMeta?.id && Array.isArray(data.results)) {
+          const chip = data.results.join(" · ");
+          toast("Memory: " + chip, "ok");
+        }
+        break;
+      }
+      case "memory-updated": {
+        if (typeof data.text === "string") app.memory = data.text;
+        break;
+      }
+      case "vision": {
+        if (data.state === "unavailable" && !app.visionToastShown) {
+          app.visionToastShown = true;
+          toast("Vision isn't available on this engine right now" + (data.detail ? ` — ${data.detail}` : ". Text chat works as usual."), "error");
+        } else if (data.state === "ready" && !app.visionToastShown) {
+          app.visionToastShown = true;
+        }
+        break;
+      }
     }
   };
 }
@@ -881,8 +955,8 @@ function confirmDialog(title: string, text: string, onYes: () => void): void {
 
 function openSettings(tab = "general"): void {
   const s = app.settings;
-  const tabs = ["general", "identity", "model", "search", "interface"];
-  const labels: Record<string, string> = { general: "Engine", identity: "You", model: "Model", search: "Search", interface: "Interface" };
+  const tabs = ["general", "identity", "skills", "model", "search", "interface"];
+  const labels: Record<string, string> = { general: "Engine", identity: "You", skills: "Skills", model: "Model", search: "Search", interface: "Interface" };
   const body = modal("Settings", "", {
     wide: true,
     onMount: (m) => renderSettingsTab(tab, m),
@@ -912,13 +986,21 @@ function renderSettingsTab(tab: string, m: HTMLElement): void {
   if (tab === "general") {
     html = `
       <div class="setting-row"><label class="main">Auto-rest timer</label>
-        <div class="desc">When you walk away, your engine saves everything and rests, giving your GPU hours back. Reading mode waits longer — pick 6 minutes if you like to read replies slowly.</div>
+        <div class="desc">When you walk away, your engine saves everything and rests, giving your GPU hours back. Reading mode waits longer — pick 6 minutes if you like to read replies slowly. Applies to a running engine right away.</div>
         <div class="range-row">
           <input type="range" id="set-afk" min="3" max="6" step="3" value="${s.afkMinutes}"/>
           <span class="range-val" id="set-afk-val">${s.afkMinutes === 6 ? "6 min — reading mode" : "3 min"}</span>
         </div>
       </div>
       ${switchRow("set-memdef", "Memories on for new chats", "New chats share your memories by default. Each chat can turn them off individually.", s.memoryEnabled ? "checked" : "")}
+      ${switchRow("set-memtools", "Let the model manage memories", "When on, the model can create, edit, delete and restore memories by itself (with undo). It gets its own instructions for this — separate from your system prompt. Off by default.", s.memoryTools ? "checked" : "")}
+      <div class="setting-row"><label class="main">Restart engine</label>
+        <div class="desc">Reloads the engine with your current context size and the latest engine version. The model comes from your Kaggle storage, so this takes a few minutes, not a re-download. Nothing else here needs a restart — prompts, skills, memory, vision and the rest timer all apply on the fly.</div>
+        <div style="display:flex;gap:8px">
+          <button class="btn" id="set-restart">Restart engine</button>
+          <button class="btn" id="set-sleep">Rest now</button>
+        </div>
+      </div>
     `;
   } else if (tab === "identity") {
     const f = s.fancy;
@@ -937,19 +1019,73 @@ function renderSettingsTab(tab: string, m: HTMLElement): void {
         <div class="setting-row"><label class="main">Assistant name</label><input type="text" id="set-aname" value="${esc(f.assistantName)}"/></div>
         <div class="setting-row"><label class="main">Its character</label><input type="text" id="set-arole" value="${esc(f.role)}"/></div>
         <div class="setting-row"><label class="main">How it should respond</label><input type="text" id="set-astyle" value="${esc(f.responseStyle)}"/></div>
+      </div>
+      <div class="about-divider">About you</div>
+      <div class="setting-row"><label class="main">A few words about yourself</label>
+        <div class="desc">Free-form, whatever you want it to always know — your work, your projects, how you like to talk. It's treated as your self-description, not recited back.</div>
+        <textarea id="set-about" placeholder="e.g. I'm a solo developer building tools... I prefer short direct answers... I work on Manjaro Linux...">${esc(s.aboutYou ?? "")}</textarea>
+      </div>
+      <div id="fancy-fields2" ${s.sysMode === "raw" ? 'style="display:none"' : ""}>
         <div class="setting-row"><label class="main">Your name</label><input type="text" id="set-uname" value="${esc(f.userName)}"/></div>
-        <div class="setting-row"><label class="main">Sex</label><select id="set-usex">${["", "male", "female"].map((v) => `<option value="${v}" ${f.userSex === v ? "selected" : ""}>${v || "prefer not to say"}</option>`).join("")}</select></div>
+        <div class="setting-row"><label class="main">Gender</label><select id="set-ugender">${["", "male", "female", "non-binary", "genderfluid", "agender", "bigender", "transgender", "androgynous"].map((v) => `<option value="${v}" ${f.userGender === v ? "selected" : ""}>${v || "prefer not to say"}</option>`).join("")}</select></div>
+        <div class="setting-row"><label class="main">Sex</label><select id="set-usex">${["", "male", "female", "intersex"].map((v) => `<option value="${v}" ${f.userSex === v ? "selected" : ""}>${v || "prefer not to say"}</option>`).join("")}</select></div>
         <div class="setting-row"><label class="main">Age</label><input type="number" id="set-uage" value="${esc(f.userAge)}" min="1" max="120"/></div>
         <div class="setting-row"><label class="main">Birthday</label><input type="text" id="set-ubday" placeholder="e.g. March 14" value="${esc(f.userBirthday)}"/></div>
         <div class="setting-row"><label class="main">Country</label><input type="text" id="set-ucountry" value="${esc(f.userCountry)}"/></div>
         <div class="setting-row"><label class="main">Time zone</label><input type="text" id="set-utz" value="${esc(f.userTimezone)}"/></div>
-        <div class="setting-row"><label class="main">Relationship status</label><select id="set-urel">${["", "single", "married", "engaged", "dating", "complicated"].map((v) => `<option value="${v}" ${f.userRelationship === v ? "selected" : ""}>${v || "prefer not to say"}</option>`).join("")}</select></div>
+        <div class="setting-row"><label class="main">What you do</label><input type="text" id="set-uocc" placeholder="e.g. developer, student, photographer" value="${esc(f.userOccupation ?? "")}"/></div>
+        <div class="setting-row"><label class="main">Relationship status</label><select id="set-urel">${["", "single", "married", "engaged", "dating", "separated", "divorced", "widowed", "complicated", "it's private"].map((v) => `<option value="${v}" ${f.userRelationship === v ? "selected" : ""}>${v || "prefer not to say"}</option>`).join("")}</select></div>
+      </div>
+      <div class="about-divider">Language</div>
+      <div class="setting-row"><label class="main">Reply language</label>
+        <div class="desc">Mirror = it answers in whatever language you write in. Device = this device's language. Fixed = always one language, even if you write in another (you can still ask it to switch).</div>
+        <div style="display:flex;gap:8px">
+          <select id="set-langmode" style="flex:1">
+            <option value="auto" ${s.language?.mode === "auto" || !s.language?.mode ? "selected" : ""}>Mirror the user</option>
+            <option value="device" ${s.language?.mode === "device" ? "selected" : ""}>This device's language</option>
+            <option value="manual" ${s.language?.mode === "manual" ? "selected" : ""}>Always this language:</option>
+          </select>
+          <select id="set-langcode" ${s.language?.mode === "manual" ? "" : 'disabled style="opacity:.5"'} style="flex:1">
+            ${[["en","English"],["ar","العربية — Arabic"],["fr","Français"],["es","Español"],["de","Deutsch"],["it","Italiano"],["pt","Português"],["ru","Русский"],["tr","Türkçe"],["zh","中文"],["ja","日本語"],["ko","한국어"],["hi","हिन्दी"],["ur","اردو"],["fa","فارسی"],["id","Bahasa Indonesia"],["nl","Nederlands"],["pl","Polski"],["uk","Українська"],["sv","Svenska"]].map(([c, n]) => `<option value="${c}" ${s.language?.code === c ? "selected" : ""}>${n}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+    `;
+  } else if (tab === "skills") {
+    const list = (s.skills ?? []) as any[];
+    const on = list.filter((k) => k.enabled).length;
+    html = `
+      ${switchRow("set-skillsmaster", "Skills on", "Skills are instruction modules you write once and reuse — each has a title, when to use it, why it exists, and the instructions themselves. The model follows the ones that match the current message. They ride with every message as their own block, separate from your system prompt.", s.skillsEnabled ? "checked" : "")}
+      <div class="setting-row"><label class="main">Your skills</label>
+        <div class="desc">${list.length} skill${list.length === 1 ? "" : "s"}, ${on} enabled. Enabled skills apply to every chat — each chat can exclude some of its own in Chat settings.</div>
+        <button class="btn primary" id="skill-add" ${s.skillsEnabled ? "" : 'title="Skills are switched off above"'}>+ New skill</button>
+      </div>
+      <div id="skills-list" class="skills-list">
+        ${list.length ? list.map((k) => `
+          <div class="skill-card ${k.enabled ? "on" : ""}" data-id="${esc(k.id)}">
+            <div class="skill-head">
+              <label class="switch sm"><input type="checkbox" class="skill-toggle" ${k.enabled ? "checked" : ""}/><span class="track"></span></label>
+              <div class="skill-title">
+                <b>${esc(k.title)}</b>
+                ${k.builtIn ? '<span class="skill-badge">starter</span>' : ""}
+              </div>
+              <div class="skill-actions">
+                <button class="icon-btn skill-edit" title="Edit">✎</button>
+                <button class="icon-btn danger skill-del" title="Delete">×</button>
+              </div>
+            </div>
+            ${k.when ? `<div class="skill-line"><i>When:</i> ${esc(k.when)}</div>` : ""}
+            ${k.why ? `<div class="skill-line"><i>Why:</i> ${esc(k.why)}</div>` : ""}
+            <div class="skill-body">${esc(k.content.length > 160 ? k.content.slice(0, 160) + "…" : k.content)}</div>
+          </div>
+        `).join("") : '<div class="empty-note" style="padding:14px 0">No skills yet. Create one — or think of them as playbooks: "how to review my code", "answer like a mentor", "always reply in Arabic"…</div>'}
       </div>
     `;
   } else if (tab === "model") {
+    const v = s.vision;
     html = `
       <div class="setting-row"><label class="main">Context window</label>
-        <div class="desc">How much conversation the model holds at once. The ceiling is 75,000 tokens — past roughly 60K the twin T4s get slow. Below 32K the model forgets too easily, so that's the floor.</div>
+        <div class="desc">How much conversation the model holds at once. The ceiling is 75,000 tokens — past roughly 60K the twin T4s get slow. Below 32K the model forgets too easily, so that's the floor. <b id="ctx-restart-note" style="display:none;color:var(--warn,#e5b567)">Changed — this is the one setting that needs an engine restart. Use Restart engine in the Engine tab (or it applies next time the engine starts on its own).</b></div>
         <div class="range-row">
           <input type="range" id="set-ctx" min="32768" max="75000" step="1024" value="${s.contextTokens}"/>
           <span class="range-val" id="set-ctx-val">${(s.contextTokens / 1000).toFixed(0)}K tokens</span>
@@ -960,6 +1096,30 @@ function renderSettingsTab(tab: string, m: HTMLElement): void {
       </div>
       <div class="setting-row"><label class="main">Reply length ceiling (tokens)</label>
         <input type="number" id="set-maxtok" value="${s.maxOutputTokens}" min="1024" max="65536" step="1024"/>
+      </div>
+      <div class="about-divider">Vision — images &amp; video</div>
+      ${switchRow("set-vision", "Let it see images and videos", "The model reads pictures and (as extracted frames) videos through its vision projector. It loads the moment you first send something visual — no restart, and it unloads when you switch it off. No audio.", v.enabled ? "checked" : "")}
+      <div id="vision-fields" ${v.enabled ? "" : 'style="opacity:.45"'}>
+        <div class="setting-row"><label class="main">Images / videos per message</label>
+          <div class="range-row"><input type="range" id="set-maximg" min="1" max="8" value="${v.maxImages}"/><span class="range-val">${v.maxImages}</span></div>
+        </div>
+        <div class="setting-row"><label class="main">Image size limit</label>
+          <div class="range-row"><input type="range" id="set-imgmb" min="1" max="12" value="${v.imageMaxMB}"/><span class="range-val">${v.imageMaxMB} MB</span></div>
+        </div>
+        <div class="setting-row"><label class="main">Video size limit</label>
+          <div class="desc">Videos are read as still frames, not sound. One frame every few seconds, downscaled — so a long clip costs a bounded, known amount of context, never a bottomless pit.</div>
+          <div class="range-row"><input type="range" id="set-vidmb" min="1" max="40" value="${v.videoMaxMB}"/><span class="range-val">${v.videoMaxMB} MB</span></div>
+        </div>
+        <div class="setting-row"><label class="main">Frames per video</label>
+          <div class="range-row"><input type="range" id="set-frames" min="2" max="16" value="${v.maxFrames}"/><span class="range-val">${v.maxFrames} frames</span></div>
+        </div>
+        <div class="setting-row"><label class="main">One frame every</label>
+          <div class="range-row"><input type="range" id="set-fsec" min="1" max="10" value="${v.frameSeconds}"/><span class="range-val">${v.frameSeconds}s</span></div>
+        </div>
+        <div class="setting-row"><label class="main">Media context budget</label>
+          <div class="desc">How many context tokens images and videos may occupy in one chat. Past the budget, older media step aside (marked in the chat) so the conversation itself never gets squeezed out.</div>
+          <div class="range-row"><input type="range" id="set-mbudget" min="1000" max="24000" step="1000" value="${s.mediaTokenBudget}"/><span class="range-val">${(s.mediaTokenBudget / 1000).toFixed(0)}K tokens</span></div>
+        </div>
       </div>
     `;
   } else if (tab === "search") {
@@ -995,25 +1155,43 @@ function renderSettingsTab(tab: string, m: HTMLElement): void {
     if (tab === "general") {
       patch.afkMinutes = parseInt(g("set-afk")!.value);
       patch.memoryEnabled = g("set-memdef")!.checked;
+      patch.memoryTools = g("set-memtools")!.checked;
     } else if (tab === "identity") {
       patch.sysMode = g("set-sysmode")!.value;
+      patch.aboutYou = g("set-about")!.value;
+      patch.language = { mode: g("set-langmode")!.value, code: g("set-langcode")!.value };
       if (patch.sysMode === "raw") patch.rawSystemPrompt = g("set-raw")!.value;
       else patch.fancy = {
         assistantName: g("set-aname")!.value,
         role: g("set-arole")!.value,
         responseStyle: g("set-astyle")!.value,
         userName: g("set-uname")!.value,
+        userGender: g("set-ugender")!.value,
         userSex: g("set-usex")!.value,
         userAge: g("set-uage")!.value,
         userBirthday: g("set-ubday")!.value,
         userCountry: g("set-ucountry")!.value,
         userTimezone: g("set-utz")!.value,
+        userOccupation: g("set-uocc")!.value,
         userRelationship: g("set-urel")!.value,
       };
+    } else if (tab === "skills") {
+      patch.skillsEnabled = g("set-skillsmaster")!.checked;
+      patch.skills = s.skills ?? [];
     } else if (tab === "model") {
       patch.contextTokens = parseInt(g("set-ctx")!.value);
       patch.temperature = parseFloat(g("set-temp")!.value);
       patch.maxOutputTokens = parseInt(g("set-maxtok")!.value);
+      patch.vision = {
+        ...s.vision,
+        enabled: g("set-vision")!.checked,
+        maxImages: parseInt(g("set-maximg")!.value),
+        imageMaxMB: parseInt(g("set-imgmb")!.value),
+        videoMaxMB: parseInt(g("set-vidmb")!.value),
+        maxFrames: parseInt(g("set-frames")!.value),
+        frameSeconds: parseInt(g("set-fsec")!.value),
+      };
+      patch.mediaTokenBudget = parseInt(g("set-mbudget")!.value);
     } else if (tab === "search") {
       patch.searchMaxQueries = parseInt(g("set-sq")!.value);
       patch.searchPagesPerQuery = parseInt(g("set-sp")!.value);
@@ -1029,13 +1207,41 @@ function renderSettingsTab(tab: string, m: HTMLElement): void {
     (inp as HTMLElement).addEventListener("change", async () => {
       const patch = collect();
       try {
+        const before = s.contextTokens;
         const r = await api("PUT", "/api/settings", patch);
         app.settings = r.settings;
         if (tab === "identity") renderSettingsTab(tab, m);
+        if (tab === "skills") renderSettingsTab(tab, m);
+        if (tab === "model") {
+          const g = document.getElementById("set-ctx") as HTMLInputElement | null;
+          const note = document.getElementById("ctx-restart-note");
+          if (g && note) note.style.display = parseInt(g.value) !== before ? "inline" : "none";
+          const vf = document.getElementById("vision-fields");
+          if (vf) vf.style.opacity = app.settings.vision.enabled ? "1" : ".45";
+        }
       } catch (e: any) {
         toast(e.message, "error");
       }
     });
+  });
+
+  if (tab === "skills") wireSkillsTab(m);
+
+  const restart = m.querySelector("#set-restart");
+  restart?.addEventListener("click", () => {
+    confirmDialog("Restart the engine?", "It reboots with your current context window and the latest engine version. A few minutes — the model loads from your Kaggle storage, not re-downloaded.", async () => {
+      try {
+        await api("POST", "/api/engine/restart", {});
+        toast("Engine restarting — it'll be ready in a few minutes", "ok");
+      } catch (e: any) {
+        toast(e.message, "error");
+      }
+    });
+  });
+  const sleepBtn = m.querySelector("#set-sleep");
+  sleepBtn?.addEventListener("click", async () => {
+    await api("POST", "/api/engine/sleep");
+    toast("Engine resting — GPU hours are back in your pocket", "ok");
   });
 
   const logout = m.querySelector("#set-logout");
@@ -1045,6 +1251,91 @@ function renderSettingsTab(tab: string, m: HTMLElement): void {
       location.reload();
     });
   });
+}
+
+function wireSkillsTab(m: HTMLElement): void {
+  const add = m.querySelector("#skill-add");
+  add?.addEventListener("click", () => openSkillEditor(null, m));
+  m.querySelectorAll(".skill-card").forEach((card) => {
+    const id = (card as HTMLElement).dataset.id!;
+    card.querySelector(".skill-toggle")!.addEventListener("change", async (e) => {
+      const sk = app.settings.skills.find((x: any) => x.id === id);
+      if (!sk) return;
+      sk.enabled = (e.target as HTMLInputElement).checked;
+      card.classList.toggle("on", sk.enabled);
+      await api("PUT", "/api/settings", { skills: app.settings.skills, skillsEnabled: app.settings.skillsEnabled });
+    });
+    card.querySelector(".skill-edit")!.addEventListener("click", () => {
+      const sk = app.settings.skills.find((x: any) => x.id === id);
+      if (sk) openSkillEditor(sk, m);
+    });
+    card.querySelector(".skill-del")!.addEventListener("click", () => {
+      const sk = app.settings.skills.find((x: any) => x.id === id);
+      confirmDialog(`Delete "${sk?.title ?? "skill"}"?`, "The model stops following it immediately. There's no undo for deleted skills.", async () => {
+        app.settings.skills = app.settings.skills.filter((x: any) => x.id !== id);
+        await api("PUT", "/api/settings", { skills: app.settings.skills, skillsEnabled: app.settings.skillsEnabled });
+        renderSettingsTab("skills", m);
+      });
+    });
+  });
+}
+
+function openSkillEditor(existing: any, settingsBody: HTMLElement): void {
+  const isNew = !existing;
+  const k = existing ?? { id: "", title: "", when: "", why: "", content: "", enabled: true };
+  const save = el("button", "btn primary", isNew ? "Create skill" : "Save skill");
+  const cancel = el("button", "btn", "Cancel");
+  cancel.onclick = () => closeModal();
+  const body = modal(isNew ? "New skill" : `Edit "${k.title}"`, `
+    <div class="setting-row"><label class="main">Title</label>
+      <input type="text" id="sk-title" value="${esc(k.title)}" placeholder="e.g. Code review mode" maxlength="80"/>
+    </div>
+    <div class="setting-row"><label class="main">When to use it</label>
+      <div class="desc">The condition that decides if this skill applies to the current message. Be concrete.</div>
+      <input type="text" id="sk-when" value="${esc(k.when)}" placeholder="e.g. The user shares code and asks for review" maxlength="400"/>
+    </div>
+    <div class="setting-row"><label class="main">Why it exists</label>
+      <div class="desc">One line of intent — this keeps the model honest about the spirit of the skill.</div>
+      <input type="text" id="sk-why" value="${esc(k.why)}" placeholder="e.g. Keeps reviews structured instead of vague praise" maxlength="400"/>
+    </div>
+    <div class="setting-row"><label class="main">The skill</label>
+      <div class="desc">The instructions the model follows when this skill applies. Plain text, as long as it needs to be (up to 6000 characters).</div>
+      <textarea id="sk-content" style="min-height:180px" maxlength="6000" placeholder="When reviewing code:\n1. ...\n2. ...">${esc(k.content)}</textarea>
+    </div>
+    <label class="switch-row"><label class="switch"><input type="checkbox" id="sk-enabled" ${k.enabled ? "checked" : ""}/><span class="track"></span></label><div class="labels"><b>Enabled</b><span>Disabled skills stay here but don't ride along.</span></div></label>
+  `,
+  {
+    wide: true,
+    foot: [cancel, save],
+    onMount: (m) => {
+      const ta = m.querySelector("#sk-content") as HTMLTextAreaElement;
+      ta.addEventListener("keydown", (e) => e.stopPropagation());
+    },
+  });
+  save.onclick = async () => {
+    const title = (body.querySelector("#sk-title") as HTMLInputElement).value.trim();
+    const when = (body.querySelector("#sk-when") as HTMLInputElement).value.trim();
+    const why = (body.querySelector("#sk-why") as HTMLInputElement).value.trim();
+    const content = (body.querySelector("#sk-content") as HTMLTextAreaElement).value;
+    const enabled = (body.querySelector("#sk-enabled") as HTMLInputElement).checked;
+    if (!title || !content.trim()) {
+      toast("A skill needs at least a title and its instructions", "error");
+      return;
+    }
+    if (isNew) {
+      app.settings.skills.push({ id: Math.random().toString(36).slice(2, 10), title, when, why, content, enabled });
+    } else {
+      Object.assign(existing, { title, when, why, content, enabled });
+    }
+    try {
+      await api("PUT", "/api/settings", { skills: app.settings.skills, skillsEnabled: app.settings.skillsEnabled });
+      closeModal();
+      renderSettingsTab("skills", settingsBody);
+      toast(isNew ? "Skill created" : "Skill saved", "ok");
+    } catch (e: any) {
+      toast(e.message, "error");
+    }
+  };
 }
 
 // tokens modal + wizard
@@ -1101,7 +1392,7 @@ async function addTokenFlow(body: HTMLElement): Promise<void> {
   input.type = "text";
   input.placeholder = "KGAT_...";
   input.style.cssText = "width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--line);background:var(--bg);outline:none;";
-  const save = el("button", "btn primary", "Verify & add");
+  const save = el("button", "btn primary", "Verify & add") as HTMLButtonElement;
   const cancel = el("button", "btn", "Cancel");
   save.onclick = async () => {
     const secret = input.value.trim();
@@ -1182,6 +1473,7 @@ function openChatSettings(): void {
   const meta = app.currentMeta;
   const full = app.current;
   const o = full.override ?? {};
+  const langMode = o.languageMode ?? "inherit";
   modal(`Settings for "${meta.name}"`, `
     <div class="setting-row"><label class="main">Custom system prompt</label>
       <div class="desc">Replaces the global one for this chat only — handy for different personalities or tasks.</div>
@@ -1189,6 +1481,26 @@ function openChatSettings(): void {
     </div>
     <div class="setting-row"><label class="main">Creativity override</label>
       <div class="range-row"><input type="range" id="cs-temp" min="0" max="2" step="0.05" value="${o.temperature ?? app.settings.temperature}"/><span class="range-val" id="cs-temp-val">${o.temperature ?? app.settings.temperature}</span></div>
+    </div>
+    <div class="setting-row"><label class="main">Skills in this chat</label>
+      <div class="desc">Gates all skills for this conversation — the global switch and each skill's own toggle still apply everywhere else.</div>
+      <select id="cs-skills">
+        <option value="inherit" ${o.skillsEnabled === undefined ? "selected" : ""}>Follow the global switch</option>
+        <option value="on" ${o.skillsEnabled === true ? "selected" : ""}>Always on here</option>
+        <option value="off" ${o.skillsEnabled === false ? "selected" : ""}>Always off here</option>
+      </select>
+    </div>
+    <div class="setting-row"><label class="main">Reply language for this chat</label>
+      <div class="desc">Overrides your global language choice, just for this conversation.</div>
+      <select id="cs-lang">
+        <option value="inherit" ${langMode === "inherit" ? "selected" : ""}>Follow the global setting</option>
+        <option value="auto" ${langMode === "auto" ? "selected" : ""}>Mirror the user</option>
+        <option value="device" ${langMode === "device" ? "selected" : ""}>This device's language</option>
+        <option value="manual" ${langMode === "manual" ? "selected" : ""}>Always this language:</option>
+      </select>
+      <select id="cs-langcode" ${langMode === "manual" ? "" : 'disabled style="opacity:.5"'} style="margin-top:8px">
+        ${[["en","English"],["ar","العربية — Arabic"],["fr","Français"],["es","Español"],["de","Deutsch"],["it","Italiano"],["pt","Português"],["ru","Русский"],["tr","Türkçe"],["zh","中文"],["ja","日本語"],["ko","한국어"],["hi","हिन्दी"],["ur","اردو"],["fa","فارسی"]].map(([c, n]) => `<option value="${c}" ${(o.languageCode ?? "") === c ? "selected" : ""}>${n}</option>`).join("")}
+      </select>
     </div>
   `, {
     foot: [
@@ -1207,8 +1519,17 @@ function openChatSettings(): void {
         b.onclick = async () => {
           const sys = ($("#cs-sys") as HTMLTextAreaElement).value.trim();
           const temp = parseFloat(($("#cs-temp") as HTMLInputElement).value);
+          const sk = ($("#cs-skills") as HTMLSelectElement).value;
+          const lm = ($("#cs-lang") as HTMLSelectElement).value;
+          const lc = ($("#cs-langcode") as HTMLSelectElement).value;
           await api("PATCH", `/api/sessions/${meta.id}`, {
-            override: { systemPrompt: sys || undefined, temperature: temp },
+            override: {
+              systemPrompt: sys || undefined,
+              temperature: temp,
+              skillsEnabled: sk === "inherit" ? undefined : sk === "on",
+              languageMode: lm === "inherit" ? undefined : (lm as any),
+              languageCode: lm === "manual" ? lc : undefined,
+            },
           });
           await openSession(meta.id);
           closeModal();
@@ -1217,6 +1538,15 @@ function openChatSettings(): void {
         return b;
       })(),
     ],
+    onMount: (m) => {
+      m.querySelector("#cs-lang")!.addEventListener("change", (e) => {
+        const sel = e.target as HTMLSelectElement;
+        const code = m.querySelector("#cs-langcode") as HTMLSelectElement;
+        const manual = sel.value === "manual";
+        code.disabled = !manual;
+        code.style.opacity = manual ? "1" : ".5";
+      });
+    },
   });
 }
 
@@ -1319,7 +1649,7 @@ function renderComparePane(wrap: HTMLElement, sid: string, sess: any): void {
   body.appendChild(inner);
   const composerWrap = el("div", "composer-wrap");
   const composer = el("div", "composer");
-  const ta = el("textarea");
+  const ta = el("textarea") as HTMLTextAreaElement;
   ta.rows = 1;
   ta.placeholder = `Message "${sess.name}" — Shift+Enter for newline`;
   const sendBoth = el("button", "btn", "Both");
@@ -1366,6 +1696,8 @@ function renderToggles(): void {
   $("#toggle-search").classList.toggle("on", !!meta.searchEnabled);
   $("#toggle-think").classList.toggle("on", !!meta.thinkingEnabled);
   $("#toggle-memory").classList.toggle("on", !!meta.memoryEnabled);
+  $("#toggle-vision").classList.toggle("on", !!meta.visionEnabled);
+  $("#toggle-vision").style.display = app.settings?.vision?.enabled ? "" : "none";
   $("#toggle-compare").classList.toggle("on", app.compareOpen);
 }
 
@@ -1416,6 +1748,11 @@ Linux:    ./shuggle-lan.sh</pre>
     await api("PATCH", `/api/sessions/${app.currentMeta.id}`, { memoryEnabled: !app.currentMeta.memoryEnabled });
     await openSession(app.currentMeta.id);
   };
+  $("#toggle-vision").onclick = async () => {
+    if (!app.currentMeta) return;
+    await api("PATCH", `/api/sessions/${app.currentMeta.id}`, { visionEnabled: !app.currentMeta.visionEnabled });
+    await openSession(app.currentMeta.id);
+  };
   $("#toggle-compare").onclick = toggleCompare;
 
   const input = $("#input") as HTMLTextAreaElement;
@@ -1432,7 +1769,14 @@ Linux:    ./shuggle-lan.sh</pre>
     toast("Engine resting — GPU hours are back in your pocket", "ok");
   };
   $("#btn-attach").onclick = () => $("#file-input").click();
+  $("#btn-image").onclick = () => $("#media-input").click();
+  $("#btn-video").onclick = () => $("#media-input").click();
   $("#file-input").addEventListener("change", (e) => {
+    const files = (e.target as HTMLInputElement).files;
+    if (files?.length) addFiles(files);
+    (e.target as HTMLInputElement).value = "";
+  });
+  $("#media-input").addEventListener("change", (e) => {
     const files = (e.target as HTMLInputElement).files;
     if (files?.length) addFiles(files);
     (e.target as HTMLInputElement).value = "";

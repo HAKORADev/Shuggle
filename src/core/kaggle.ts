@@ -226,7 +226,7 @@ export class Kaggle {
     const put = await fetch(createUrl, {
       method: "PUT",
       headers: { "Content-Type": "application/octet-stream" },
-      body: content,
+      body: content as any,
     });
     if (put.status !== 200 && put.status !== 201) {
       throw new KaggleError(`blob put: HTTP ${put.status}`);

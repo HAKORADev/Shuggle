@@ -1,16 +1,21 @@
-// Shuggle — engine kernel generator.
+// Shuggle — engine kernel generator (v3).
 //
 // Produces the Python script that runs on Kaggle (one engine per token's
 // account). Design mirrors HAKORA's unqwen reboot-safe pattern, adapted for
 // app-driven operation over pure Kaggle API:
-//   - deps: skip install when the environment already has them
-//   - model: mounted from the private `shuggle-model` dataset (no download),
-//     with an HF fallback if the dataset is missing
-//   - sessions + memory: persisted in the private `shuggle-store` dataset,
-//     loaded at boot — the app never re-pushes sessions on reboot
-//   - commands: private `shuggle-inbox` dataset (dedupe by `v`)
+//   - deps: installed into the persistent working folder when possible —
+//     later boots skip the install entirely (unqwen "permanent files" trick)
+//   - model: mounted from the private `shuggle-model` dataset (GGUF + mmproj),
+//     copied once to local disk for fast loads — no mmap-from-FUSE crawl
+//   - sessions + memory (incl. soft-deleted memory + revision log): persisted
+//     in the private `shuggle-store` dataset, loaded at boot
+//   - commands: private `shuggle-inbox` dataset (cmd.json + media files),
+//     deduped by `v`
 //   - streaming: SHUGGLE lines on stdout (live via the kernel log stream)
 //     + durable state in the private `shuggle-outbox` dataset
+//   - vision: mmproj handler loaded/unloaded on demand — never a restart
+//   - skills: separate system message with its own handler prompt
+//   - memory tools: create/edit/delete/list/list_deleted/undo with revisions
 
 import { ENGINE_VERSION } from "../version.ts";
 
@@ -35,6 +40,8 @@ interface CmdChat {
   memory_hash?: string | null;
   memory_text?: string | null;
   thinking: boolean;
+  skills?: { title: string; when: string; why: string; content: string }[];
+  media?: { name: string; kind: "image" | "video"; file: string; mid?: string }[];
 }
 
 type Cmd = { v: number; type: string; profile: string } & Record<string, any>;
@@ -48,10 +55,14 @@ export function engineScript(cfg: EngineConfig): string {
 
 const ENGINE_BODY = String.raw`
 # Engine v__ENGINE_VERSION__
+import base64
+import glob
 import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -65,9 +76,17 @@ PROFILE = CFG["profile"]
 
 MODEL_REPO = "JonathanColetti/Qwen3.8-27B-Uncensored-GGUF"
 MODEL_FILE = "Qwen3.8-27B-Uncensored-Q4_K_M.gguf"
-STORE_SLUG = "shuggle-store"
-INBOX_SLUG = "shuggle-inbox"
-OUTBOX_SLUG = "shuggle-outbox"
+MMPROJ_HINT = "mmproj"
+WORK = "/kaggle/working"
+LIBS_DIR = os.path.join(WORK, "shugglibs")
+MODEL_DIR = os.path.join(WORK, "model")
+MEDIA_DIR = os.path.join(WORK, "media")
+def _slugns(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:20]
+NS = _slugns(PROFILE)
+STORE_SLUG = "shuggle-store-" + NS
+INBOX_SLUG = "shuggle-inbox-" + NS
+OUTBOX_SLUG = "shuggle-outbox-" + NS
 
 SEARCH_QUERIES_PROMPT = (
     "You generate web search queries. Given the conversation and the user's latest "
@@ -82,6 +101,39 @@ SEARCH_DIGEST_PROMPT = (
     "preserved accurately with their source titles in parentheses. No opinions, no "
     "advice, no filler, do not answer the user directly. If results are irrelevant or "
     "empty, output exactly: NO_RESULTS."
+)
+SKILLS_HANDLER_PROMPT = (
+    "The user has enabled Skill modules for this chat. Skills are instructions the "
+    "user chose in advance - treat them as standing directives from the user, with "
+    "slightly lower priority than what the user types in the moment.\n"
+    "How to use them:\n"
+    "- If the current message matches a skill's 'when it applies' condition, follow "
+    "that skill fully for this reply.\n"
+    "- If no skill matches, ignore them completely and answer normally. Never mention "
+    "skills, their existence, or this block.\n"
+    "- If two skills overlap, satisfy both where compatible; otherwise the more "
+    "specific one wins.\n"
+    "- Skills never override the user's latest explicit request."
+)
+MEMORY_TOOLS_PROMPT = (
+    "You can manage long-term memories with memory operations. To run one, emit a "
+    "fenced block like:\n"
+    "memory-ops\n"
+    '[{"op": "create", "name": "short-name", "content": "the memory text"}]\n'
+    "and close the fence. Rules:\n"
+    "- Ops: create (name + content), edit (id or name + new content), delete (id or "
+    "name), list, list_deleted, undo (optionally with id).\n"
+    "- Emit a block ONLY when the user shares something worth remembering long-term, "
+    "asks what you remember, asks you to change or forget a memory, or explicitly "
+    "wants the list. Do not create memories for small talk or temporary context.\n"
+    "- Keep each memory short and factual (one or two sentences).\n"
+    "- You may emit multiple blocks in one reply if needed.\n"
+    "- The app strips these blocks before your reply is shown; do not repeat their "
+    "content in your visible text.\n"
+    "- If an op fails (e.g. memory full), a system note will tell you next turn - "
+    "then tell the user honestly.\n"
+    "The fence marker is three backticks, the word memory-ops, then JSON, then three "
+    "backticks - exactly like a normal code block."
 )
 
 def slog(m):
@@ -100,37 +152,45 @@ def rpc(method, body, timeout=120):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
+def _download_bytes(owner, slug, file_name, timeout=120):
+    req = urllib.request.Request(
+        BASE + "/datasets.DatasetApiService/DownloadDataset",
+        data=json.dumps({"ownerSlug": owner, "datasetSlug": slug, "fileName": file_name, "raw": True}).encode(),
+        headers={"Authorization": "Bearer " + CFG["bearer"], "Content-Type": "application/json"},
+        method="POST",
+    )
+    class NR(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    op = urllib.request.build_opener(NR)
+    try:
+        r = op.open(req, timeout=timeout)
+        return r.read()
+    except urllib.error.HTTPError as e:
+        if e.status in (301, 302, 303, 307, 308):
+            with urllib.request.urlopen(e.headers["Location"], timeout=timeout) as r2:
+                return r2.read()
+        raise
+
 def hsh(obj):
     return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
 
 # ---------------------------------------------------------------- store ----
-STORE = {"sessions": {}, "memory": {"text": "", "hash": ""}}
+STORE = {"sessions": {}, "memory": {"text": "", "hash": "", "deleted": [], "log": []}}
 
 def load_store():
     try:
-        req = urllib.request.Request(
-            BASE + "/datasets.DatasetApiService/DownloadDataset",
-            data=json.dumps({"ownerSlug": OWNER, "datasetSlug": STORE_SLUG, "fileName": "store.json", "raw": True}).encode(),
-            headers={"Authorization": "Bearer " + CFG["bearer"], "Content-Type": "application/json"},
-            method="POST",
-        )
-        class NR(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *a, **k):
-                return None
-        op = urllib.request.build_opener(NR)
-        try:
-            r = op.open(req, timeout=60)
-            raw = r.read().decode()
-        except urllib.error.HTTPError as e:
-            if e.status in (301, 302, 303, 307, 308):
-                with urllib.request.urlopen(e.headers["Location"], timeout=60) as r2:
-                    raw = r2.read().decode()
-            else:
-                raise
-        data = json.loads(raw)
+        raw = _download_bytes(OWNER, STORE_SLUG, "store.json")
+        data = json.loads(raw.decode())
         if isinstance(data, dict):
             STORE["sessions"] = data.get("sessions", {})
-            STORE["memory"] = data.get("memory", {"text": "", "hash": ""})
+            mem = data.get("memory", {})
+            STORE["memory"] = {
+                "text": mem.get("text", ""),
+                "hash": mem.get("hash", ""),
+                "deleted": mem.get("deleted", []),
+                "log": mem.get("log", []),
+            }
         slog({"ev": "meta", "phase": "store-loaded", "sessions": len(STORE["sessions"])})
     except Exception as e:
         err("store-load", e)
@@ -162,32 +222,27 @@ SEEN_V = 0
 def read_cmd():
     global SEEN_V
     try:
-        req = urllib.request.Request(
-            BASE + "/datasets.DatasetApiService/DownloadDataset",
-            data=json.dumps({"ownerSlug": OWNER, "datasetSlug": INBOX_SLUG, "fileName": "cmd.json", "raw": True}).encode(),
-            headers={"Authorization": "Bearer " + CFG["bearer"], "Content-Type": "application/json"},
-            method="POST",
-        )
-        class NR(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *a, **k):
-                return None
-        op = urllib.request.build_opener(NR)
-        try:
-            r = op.open(req, timeout=30)
-            raw = r.read().decode()
-        except urllib.error.HTTPError as e:
-            if e.status in (301, 302, 303, 307, 308):
-                with urllib.request.urlopen(e.headers["Location"], timeout=30) as r2:
-                    raw = r2.read().decode()
-            else:
-                return None
-        cmd = json.loads(raw)
+        raw = _download_bytes(OWNER, INBOX_SLUG, "cmd.json", timeout=30)
+        cmd = json.loads(raw.decode())
         if not isinstance(cmd, dict):
             return None
         if cmd.get("v", 0) <= SEEN_V:
             return None
         return cmd
     except Exception:
+        return None
+
+def fetch_media(file_name):
+    """Download a media file that traveled with the command."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", file_name)
+    dest = os.path.join("/kaggle/tmp", "inbox_" + safe)
+    try:
+        data = _download_bytes(OWNER, INBOX_SLUG, file_name, timeout=300)
+        with open(dest, "wb") as f:
+            f.write(data)
+        return dest
+    except Exception as e:
+        err("media-fetch", file_name + ": " + str(e))
         return None
 
 def outbox_push(state):
@@ -214,10 +269,15 @@ def outbox_push(state):
 slog({"ev": "meta", "phase": "booting", "engine": "__ENGINE_VERSION__", "profile": PROFILE})
 
 llm = None
+VISION = {"handler": None, "mmproj": None, "name": None, "failed": None}
 CHARS_PER_TOKEN = 3.2
+IMAGE_TOKEN_EST = 600   # 768px ViT, patch16, 2x2 merge -> ~576 embeddings + overhead
 
 def ensure_deps():
     global llm
+    # Persistent install: later boots skip pip entirely (unqwen pattern).
+    if os.path.isdir(LIBS_DIR) and LIBS_DIR not in sys.path:
+        sys.path.insert(0, LIBS_DIR)
     try:
         import llama_cpp  # noqa
         import huggingface_hub  # noqa
@@ -226,13 +286,16 @@ def ensure_deps():
     except ImportError:
         pass
     slog({"ev": "meta", "phase": "installing-deps"})
-    import subprocess
     for attempt in range(2):
         try:
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "pip"], check=False)
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "llama-cpp-python",
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
+                            "llama-cpp-python",
                             "--extra-index-url", "https://abetlen.github.io/llama-cpp-python/whl/cu121"], check=True)
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"], check=True)
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
+                            "huggingface_hub"], check=True)
+            if LIBS_DIR not in sys.path:
+                sys.path.insert(0, LIBS_DIR)
             break
         except Exception as e:
             err("deps", e)
@@ -240,29 +303,82 @@ def ensure_deps():
     import llama_cpp  # noqa
     import huggingface_hub  # noqa
 
-def find_model():
-    for root in ("/kaggle/input/shuggle-model", "/kaggle/input"):
+def find_file(prefix, suffix):
+    for root in (WORK, "/kaggle/input"):
         if not os.path.isdir(root):
             continue
         for dirpath, _dirnames, filenames in os.walk(root):
             for fn in filenames:
-                if fn.endswith(".gguf") and "draft" not in fn.lower():
-                    full = os.path.join(dirpath, fn)
-                    if os.path.getsize(full) > 5 * 1024 * 1024 * 1024:
-                        return full
+                low = fn.lower()
+                if low.startswith(prefix) and low.endswith(suffix) and "draft" not in low:
+                    return os.path.join(dirpath, fn)
     return None
+
+def copy_progress(src, dst, label):
+    """Copy with progress events. Resumes if a partial copy exists."""
+    total = os.path.getsize(src)
+    done = 0
+    if os.path.exists(dst):
+        done = os.path.getsize(dst)
+        if done >= total:
+            return dst
+        slog({"ev": "meta", "phase": "model-copy", "detail": "resuming at " + str(round(done / 1e9, 1)) + "GB"})
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    t0 = time.time()
+    with open(src, "rb") as fsrc, open(dst, "ab" if done else "wb") as fdst:
+        fsrc.seek(done)
+        while True:
+            chunk = fsrc.read(64 * 1024 * 1024)
+            if not chunk:
+                break
+            fdst.write(chunk)
+            done += len(chunk)
+            if int(time.time() - t0) > 20:
+                slog({"ev": "meta", "phase": "model-copy", "detail": str(round(done / 1e9, 1)) + " / " + str(round(total / 1e9, 1)) + " GB"})
+                t0 = time.time()
+    return dst
 
 def boot_model():
     global llm, CHARS_PER_TOKEN
     ensure_deps()
     slog({"ev": "meta", "phase": "finding-model"})
-    path = find_model()
-    if path:
-        slog({"ev": "meta", "phase": "model-from-dataset", "detail": os.path.basename(path)})
+    mounted = None
+    for dirpath, _dirnames, filenames in os.walk("/kaggle/input"):
+        for fn in filenames:
+            if fn.lower() == MODEL_FILE.lower():
+                mounted = os.path.join(dirpath, fn)
+                break
+        if mounted:
+            break
+    if mounted:
+        local = os.path.join(MODEL_DIR, MODEL_FILE)
+        if os.path.exists(local) and os.path.getsize(local) == os.path.getsize(mounted):
+            path = local
+            slog({"ev": "meta", "phase": "model-local", "detail": "already on engine disk"})
+        else:
+            slog({"ev": "meta", "phase": "model-copy", "detail": "storing on engine disk"})
+            try:
+                path = copy_progress(mounted, local, "model")
+                slog({"ev": "meta", "phase": "model-copied", "detail": round(os.path.getsize(path) / 1e9, 1)})
+            except OSError as e:
+                # working folder is full — load straight from the mount instead
+                err("model-copy", e)
+                try:
+                    if os.path.exists(local):
+                        os.remove(local)
+                except Exception:
+                    pass
+                path = mounted
     else:
         slog({"ev": "meta", "phase": "model-download-fallback"})
+        # /kaggle/tmp — big VM disk, NOT the quota-limited working folder
         from huggingface_hub import hf_hub_download
-        path = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE, local_dir="/kaggle/tmp")
+        try:
+            path = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE, local_dir="/kaggle/tmp/model")
+        except Exception as e:
+            err("hf-download", e)
+            path = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE, local_dir="/kaggle/tmp/model",
+                                   force_download=True)
     slog({"ev": "meta", "phase": "loading-model"})
     from llama_cpp import Llama
     t0 = time.time()
@@ -288,6 +404,115 @@ def boot_model():
         slog({"ev": "probe", "chars_per_token": ratios, "ctx": int(CFG.get("contextTokens", 75000))})
     except Exception as e:
         err("probe", e)
+
+# ---------------------------------------------------------------- vision ----
+def vision_available():
+    return VISION.get("handler") is not None
+
+def vision_check_ready():
+    """Verify an mmproj exists and remember where. Cheap; no model work yet."""
+    if VISION.get("mmproj"):
+        return True
+    p = find_file(MMPROJ_HINT, ".gguf")
+    if not p:
+        return False
+    VISION["mmproj"] = p
+    return True
+
+def vision_ensure_loaded():
+    """Load the multimodal projector on first use. No engine restart ever."""
+    if VISION.get("handler"):
+        return True
+    if VISION.get("failed"):
+        return False
+    if not vision_check_ready():
+        VISION["failed"] = "no mmproj found on this account's model storage"
+        slog({"ev": "vision-unavailable", "d": VISION["failed"]})
+        return False
+    if llm is None:
+        return False
+    try:
+        import llama_cpp
+        names = ["Qwen3VLChatHandler", "Qwen25VLChatHandler", "Qwen2VLChatHandler", "Llava15ChatHandler"]
+        handler_cls = None
+        picked = None
+        for n in names:
+            if hasattr(llama_cpp, n):
+                handler_cls = getattr(llama_cpp, n)
+                picked = n
+                break
+        if handler_cls is None:
+            VISION["failed"] = "installed engine build has no vision handler"
+            slog({"ev": "vision-unavailable", "d": VISION["failed"]})
+            return False
+        t0 = time.time()
+        VISION["handler"] = handler_cls(VISION["mmproj"])
+        VISION["name"] = picked
+        llm.chat_handler = VISION["handler"]
+        slog({"ev": "vision-ready", "detail": picked, "load_s": round(time.time() - t0, 1)})
+        return True
+    except Exception as e:
+        VISION["failed"] = str(e)[:300]
+        VISION["handler"] = None
+        slog({"ev": "vision-unavailable", "d": VISION["failed"]})
+        return False
+
+def vision_unload():
+    if VISION.get("handler") and llm is not None:
+        try:
+            llm.chat_handler = None
+        except Exception:
+            pass
+    VISION["handler"] = None
+    slog({"ev": "vision-unloaded"})
+
+def media_to_frames(video_path, max_frames, every_n):
+    """Extract frames from a video with ffmpeg - hard caps protect the context."""
+    outdir = "/kaggle/tmp/frames_" + str(int(time.time() * 1000))
+    os.makedirs(outdir, exist_ok=True)
+    vf = "fps=1/" + str(max(1, int(every_n))) + ",scale='min(640,iw)':-2"
+    try:
+        subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vf", vf, "-frames:v",
+                        str(max_frames), "-q:v", "7", os.path.join(outdir, "f_%03d.jpg")],
+                       check=True, capture_output=True, timeout=180)
+    except Exception as e:
+        err("ffmpeg", e)
+        return []
+    frames = sorted(glob.glob(os.path.join(outdir, "f_*.jpg")))[:max_frames]
+    return frames
+
+def image_b64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+def build_media_message(base_text, media_items, mid):
+    """Turn command media into a multimodal user message. Returns (msg, est_tokens)."""
+    content_parts = [{"type": "text", "text": base_text}]
+    est = 0
+    notes = []
+    for item in media_items:
+        local = item.get("_local")
+        if not local:
+            notes.append("[attachment unavailable: " + item.get("name", "?") + "]")
+            continue
+        if item.get("kind") == "video":
+            frames = media_to_frames(local, int(CFG.get("visionMaxFrames", 8)), int(CFG.get("visionFrameSeconds", 2)))
+            if not frames:
+                notes.append("[video could not be read: " + item.get("name", "?") + "]")
+                continue
+            notes.append("[video: " + item.get("name", "?") + " — " + str(len(frames)) + " frames, one every " + str(CFG.get("visionFrameSeconds", 2)) + "s]")
+            for fp in frames:
+                content_parts.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_b64(fp)}})
+                est += 350
+        else:
+            notes.append("[image: " + item.get("name", "?") + "]")
+            content_parts.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_b64(local)}})
+            est += IMAGE_TOKEN_EST
+    text = base_text
+    if notes:
+        text = text + "\n\n" + "\n".join(notes)
+    content_parts[0] = {"type": "text", "text": text}
+    return {"role": "user", "content": content_parts}, est
 
 # ------------------------------------------------------------ generation ----
 class Splitter:
@@ -360,14 +585,13 @@ class Splitter:
             self.buf = ""
         return None
 
-def generate(sid, msg_id, messages, settings, thinking, search_cfg):
+def generate(sid, messages, settings, thinking, search_cfg):
     if not thinking:
         messages = [dict(m) for m in messages]
         if messages and messages[-1]["role"] == "user":
             messages[-1]["content"] = messages[-1]["content"].rstrip() + " /no_think"
     t0 = time.time()
     out_tokens = 0
-    trims = 0
     search_brief = None
     search_queries = []
     if search_cfg and search_cfg.get("enabled"):
@@ -383,14 +607,12 @@ def generate(sid, msg_id, messages, settings, thinking, search_cfg):
     seq = 0
     last_emit = time.time()
     pending = {"think": "", "text": ""}
-    total_out = ""
     for chunk in stream:
         delta = chunk["choices"][0].get("delta", {}) if chunk.get("choices") else {}
         piece = delta.get("content") or ""
         if not piece:
             continue
         out_tokens += 1
-        total_out += piece
         for evk in sp.feed(piece):
             pending[evk["k"]] += evk["t"]
         now = time.time()
@@ -418,7 +640,6 @@ def generate(sid, msg_id, messages, settings, thinking, search_cfg):
         "thinking": thinking_out,
         "gen_ms": gen_ms,
         "out_tokens": out_tokens,
-        "trims": trims,
         "search_brief": search_brief,
         "search_queries": search_queries,
     }
@@ -475,7 +696,7 @@ def parse_results(html, url):
 def do_search(messages, search_cfg, settings):
     max_q = int(search_cfg.get("max_queries", 3))
     pages = int(search_cfg.get("pages_per_query", 1))
-    convo_tail = "\n".join(m.get("content", "")[:600] for m in messages[-6:])
+    convo_tail = "\n".join(m.get("content", "")[:600] if isinstance(m.get("content"), str) else "" for m in messages[-6:])
     slog({"ev": "search", "phase": "planning"})
     res = llm.create_chat_completion(
         messages=[{"role": "system", "content": SEARCH_QUERIES_PROMPT.replace("{max_q}", str(max_q))},
@@ -512,110 +733,162 @@ def do_search(messages, search_cfg, settings):
     })
     return brief, queries, new_messages
 
-# ------------------------------------------------------------ dispatcher ----
-def handle_chat(cmd):
-    sid = cmd["sid"]
-    sess = STORE["sessions"].get(sid, {"history": []})
-    hist = sess.get("history", [])
-    upto = cmd.get("upto_hash", "")
-    cur_hash = hsh(hist)
-    if cur_hash != upto:
-        tm = cmd.get("truncate_mid")
-        if tm:
-            idx = next((i for i, m in enumerate(hist) if m.get("mid") == tm), -1)
-            if idx >= 0 and hsh(hist[:idx]) == upto:
-                hist = hist[:idx]
-                cur_hash = hsh(hist)
-    if cur_hash != upto:
-        ta = cmd.get("truncate_after_mid")
-        if ta:
-            idx = next((i for i, m in enumerate(hist) if m.get("mid") == ta), -1)
-            if idx >= 0 and hsh(hist[: idx + 1]) == upto:
-                hist = hist[: idx + 1]
-                cur_hash = hsh(hist)
-    if cur_hash != upto:
-        tb = cmd.get("truncate_before_mid")
-        if tb:
-            idx = next((i for i, m in enumerate(hist) if m.get("mid") == tb), -1)
-            if idx >= 0 and hsh(hist[:idx]) == upto:
-                hist = hist[:idx]
-                cur_hash = hsh(hist)
-    if cur_hash != upto:
-        slog({"ev": "resync", "sid": sid, "hash": hsh(hist)})
-        STORE["sessions"][sid] = {"history": hist}
-        save_store()
-        return
-    for m in cmd.get("new_msgs", []):
-        hist.append({"role": m["role"], "content": m["content"], "mid": m.get("mid")})
-    # sliding window: keep under ~98% of the context window (chars estimate)
-    limit = int(CFG.get("contextTokens", 75000)) * 0.98 * CHARS_PER_TOKEN
-    def total_chars(h, syslen):
-        return syslen + sum(len(m["content"]) for m in h)
-    while total_chars(hist, len(cmd.get("system", ""))) > limit and len(hist) > 3:
-        hist.pop(0)
-    msgs = [{"role": "system", "content": cmd.get("system", "")}]
-    msgs += [{"role": m["role"], "content": m["content"]} for m in hist]
-    if cmd.get("memory_text") is not None and cmd.get("memory_hash") is not None:
-        if STORE["memory"].get("hash") != cmd["memory_hash"]:
-            STORE["memory"] = {"text": cmd["memory_text"], "hash": cmd["memory_hash"]}
-    slog({"ev": "gen-start", "sid": sid})
-    try:
-        result = generate(sid, cmd.get("msg_id"), msgs, cmd.get("settings", {}),
-                          bool(cmd.get("thinking", True)), cmd.get("search"))
-    except Exception as e:
-        err("generate", e)
-        slog({"ev": "failed", "sid": sid, "d": str(e)[:300]})
-        outbox_push({"ev": "failed", "sid": sid, "v": cmd.get("v", 0), "d": str(e)[:300]})
-        return
-    if bool(CFG.get("memoryTools", False)):
-        ops, cleaned = extract_memory_ops(result["content"])
-        if ops:
-            result["content"] = cleaned
-            apply_memory_ops(ops)
-    hist.append({"role": "assistant", "content": result["content"]})
-    STORE["sessions"][sid] = {"history": hist}
-    slog({"ev": "done", "sid": sid, "msg_id": cmd.get("msg_id"), "gen_ms": result["gen_ms"],
-          "out_tokens": result["out_tokens"], "chars": len(result["content"]),
-          "think_chars": len(result["thinking"] or ""), "search_brief": result["search_brief"],
-          "search_queries": result["search_queries"]})
-    outbox_push({"ev": "done", "sid": sid, "v": cmd.get("v", 0), "gen_ms": result["gen_ms"],
-                 "chars": len(result["content"]), "think_chars": len(result["thinking"] or ""),
-                 "content": result["content"],
-                 "thinking": result["thinking"],
-                 "search_brief": result["search_brief"],
-                 "search_queries": result["search_queries"]})
-    save_store()
-
-def handle_edit_path(cmd):
-    sid = cmd["sid"]
-    hist = [{"role": m["role"], "content": m["content"], "mid": m.get("mid")} for m in cmd.get("history", [])]
-    STORE["sessions"][sid] = {"history": hist}
-    slog({"ev": "hash", "sid": sid, "hash": hsh(hist)})
-    save_store()
-
-# ------------------------------------------------------- memory ops (opt) ----
+# ------------------------------------------------------- memory ops (v3) ----
 MEM_CAP = 10000
+MEM_DELETED_CAP = 50
+MEM_LOG_CAP = 10
+
+def mem_state():
+    return STORE["memory"]
+
+def mem_blocks():
+    return parse_mem_blocks(mem_state().get("text", ""))
+
+def mem_set_text(new_text):
+    mem_state()["text"] = new_text
+    mem_state()["hash"] = hsh(new_text)
+    slog({"ev": "mem", "hash": mem_state()["hash"], "text": new_text})
+
+def mem_log(line):
+    log = mem_state().setdefault("log", [])
+    log.append(line)
+    mem_state()["log"] = log[-MEM_LOG_CAP:]
+
+def mem_op_create(op):
+    content = str(op.get("content", "")).strip()[:2000]
+    if not content:
+        return "create needs content"
+    blocks = mem_blocks()
+    new_text = mem_state().get("text", "")
+    if len(new_text) + len(content) + 40 > MEM_CAP:
+        return "memory is full (" + str(len(new_text)) + "/" + str(MEM_CAP) + " chars) — delete something first"
+    mid = str(int(time.time()))[-6:] + str(random_below(1000))
+    name = str(op.get("name", "note")).strip()[:40] or "note"
+    blocks.append({"name": name, "id": mid, "text": content})
+    mem_set_text(serialize_mem_blocks(blocks))
+    mem_log("created #" + mid + " (" + name + ")")
+    return "created memory #" + mid
+
+def random_below(n):
+    import random
+    return random.randrange(max(1, n))
+
+def mem_op_edit(op):
+    blocks = mem_blocks()
+    for b in blocks:
+        if b["id"] == op.get("id") or b["name"] == op.get("name"):
+            if op.get("content"):
+                b["text"] = str(op["content"]).strip()[:2000]
+            if op.get("name"):
+                b["name"] = str(op["name"]).strip()[:40]
+            mem_set_text(serialize_mem_blocks(blocks))
+            mem_log("edited #" + b["id"] + " (" + b["name"] + ")")
+            return "updated memory #" + b["id"]
+    return "no memory matches " + str(op.get("id") or op.get("name"))
+
+def mem_op_delete(op):
+    blocks = mem_blocks()
+    for i, b in enumerate(blocks):
+        if b["id"] == op.get("id") or b["name"] == op.get("name"):
+            deleted = mem_state().setdefault("deleted", [])
+            deleted.append({"id": b["id"], "name": b["name"], "text": b["text"], "deletedAt": int(time.time())})
+            mem_state()["deleted"] = deleted[-MEM_DELETED_CAP:]
+            blocks.pop(i)
+            mem_set_text(serialize_mem_blocks(blocks))
+            mem_log("deleted #" + b["id"] + " (" + b["name"] + ")")
+            return "deleted memory #" + b["id"] + " (say undo to restore)"
+    return "no memory matches " + str(op.get("id") or op.get("name"))
+
+def mem_op_list(op):
+    blocks = mem_blocks()
+    if not blocks:
+        return "memory is empty"
+    lines = []
+    for b in blocks:
+        lines.append("#" + b["id"] + " " + b["name"] + ": " + b["text"][:80])
+    return "\n".join(lines)
+
+def mem_op_list_deleted(op):
+    deleted = mem_state().get("deleted", [])
+    if not deleted:
+        return "nothing deleted"
+    return "\n".join("#" + d["id"] + " " + d["name"] + ": " + d["text"][:60] for d in deleted)
+
+def mem_op_undo(op):
+    deleted = mem_state().get("deleted", [])
+    if not deleted:
+        return "nothing to undo"
+    target = None
+    if op.get("id"):
+        target = next((d for d in deleted if d["id"] == op.get("id")), None)
+    else:
+        target = sorted(deleted, key=lambda d: d.get("deletedAt", 0))[-1]
+    if not target:
+        return "no deleted memory matches " + str(op.get("id"))
+    deleted = [d for d in deleted if d["id"] != target["id"]]
+    mem_state()["deleted"] = deleted
+    blocks = mem_blocks()
+    blocks.append({"name": target["name"], "id": target["id"], "text": target["text"]})
+    mem_set_text(serialize_mem_blocks(blocks))
+    mem_log("restored #" + target["id"] + " (" + target["name"] + ")")
+    return "restored memory #" + target["id"]
+
+MEM_OPS = {
+    "create": mem_op_create,
+    "edit": mem_op_edit,
+    "delete": mem_op_delete,
+    "list": mem_op_list,
+    "list_deleted": mem_op_list_deleted,
+    "undo": mem_op_undo,
+}
+
+def apply_memory_ops(ops):
+    results = []
+    changed = False
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        fn = MEM_OPS.get(str(op.get("op", "")))
+        if not fn:
+            results.append("unknown op " + str(op.get("op")))
+            continue
+        try:
+            r = fn(op)
+            results.append(r)
+            if str(op.get("op")) != "list" and str(op.get("op")) != "list_deleted" and not str(r).startswith(("no memory", "nothing", "memory is full", "create needs", "unknown")):
+                changed = True
+        except Exception as e:
+            results.append("op failed: " + str(e)[:120])
+    return results, changed
 
 def extract_memory_ops(text):
     BT = chr(96) * 3
-    marker = BT + "memory"
+    marker = BT + "memory-ops"
+    alt_marker = BT + "memory"
     ops = []
     cleaned_parts = []
     rest = text
     while True:
         start = rest.find(marker)
+        used = marker
+        if start < 0:
+            start = rest.find(alt_marker)
+            used = alt_marker
         if start < 0:
             cleaned_parts.append(rest)
             break
-        end = rest.find(BT, start + len(marker))
-        body = rest[start + len(marker):end] if end >= 0 else rest[start + len(marker):]
+        end = rest.find(BT, start + len(used))
+        body = rest[start + len(used):end] if end >= 0 else rest[start + len(used):]
         cleaned_parts.append(rest[:start])
         if end >= 0:
             rest = rest[end + 3:]
         else:
             rest = ""
+        body = body.strip()
+        if body.startswith("json"):
+            body = body[4:].strip()
         try:
-            parsed = json.loads(body.strip())
+            parsed = json.loads(body)
             if isinstance(parsed, list):
                 ops.extend(parsed)
             else:
@@ -623,45 +896,6 @@ def extract_memory_ops(text):
         except Exception:
             pass
     return ops, "".join(cleaned_parts)
-
-def apply_memory_ops(ops):
-    text = STORE["memory"].get("text", "")
-    blocks = parse_mem_blocks(text)
-    changed = False
-    results = []
-    for op in ops:
-        if not isinstance(op, dict):
-            continue
-        kind = op.get("op")
-        if kind == "create":
-            content = str(op.get("content", ""))[:2000]
-            if content and len(text) + len(content) < MEM_CAP:
-                mid = str(int(time.time()))[-6:] + str(len(blocks))
-                blocks.append({"name": str(op.get("name", "note"))[:40], "id": mid, "text": content})
-                results.append("created #" + mid)
-                changed = True
-        elif kind == "delete":
-            before = len(blocks)
-            blocks = [b for b in blocks if not (b["id"] == op.get("id") or b["name"] == op.get("name"))]
-            if len(blocks) < before:
-                results.append("deleted")
-                changed = True
-        elif kind == "edit":
-            for b in blocks:
-                if b["id"] == op.get("id") or b["name"] == op.get("name"):
-                    if op.get("content"):
-                        b["text"] = str(op["content"])[:2000]
-                    if op.get("name"):
-                        b["name"] = str(op["name"])[:40]
-                    results.append("edited #" + b["id"])
-                    changed = True
-                    break
-        elif kind == "list":
-            results.append("\n".join("#" + b["id"] + " " + b["name"] + ": " + b["text"][:60] for b in blocks) or "memory is empty")
-    if changed:
-        new_text = serialize_mem_blocks(blocks)
-        STORE["memory"] = {"text": new_text, "hash": hsh(new_text)}
-        slog({"ev": "mem", "hash": STORE["memory"]["hash"]})
 
 def parse_mem_blocks(text):
     out = []
@@ -689,11 +923,210 @@ def serialize_mem_blocks(blocks):
 
 def handle_mem(cmd):
     if cmd["type"] == "mem_set":
-        STORE["memory"] = {"text": cmd.get("text", ""), "hash": cmd.get("hash", "")}
-        slog({"ev": "mem", "hash": STORE["memory"]["hash"]})
+        mem = mem_state()
+        mem["text"] = cmd.get("text", "")
+        mem["hash"] = cmd.get("hash", "")
+        if cmd.get("deleted") is not None:
+            mem["deleted"] = cmd.get("deleted", [])
+        slog({"ev": "mem", "hash": mem["hash"]})
         save_store()
     elif cmd["type"] == "mem_get":
-        slog({"ev": "mem", "hash": STORE["memory"].get("hash", ""), "text": STORE["memory"].get("text", "")[:2000]})
+        mem = mem_state()
+        slog({"ev": "mem", "hash": mem.get("hash", ""), "text": mem.get("text", "")[:2000],
+              "deleted": len(mem.get("deleted", []))})
+
+# ------------------------------------------------------------- dispatcher ----
+def history_projection(hist):
+    """Hash-stable projection (media excluded — the app does not track bytes)."""
+    return [{"role": m["role"], "content": m["content"], **({"mid": m["mid"]} if m.get("mid") else {})} for m in hist]
+
+def handle_chat(cmd):
+    sid = cmd["sid"]
+    sess = STORE["sessions"].get(sid, {"history": []})
+    hist = sess.get("history", [])
+    upto = cmd.get("upto_hash", "")
+    cur_hash = hsh(history_projection(hist))
+    if cur_hash != upto:
+        tm = cmd.get("truncate_mid")
+        if tm:
+            idx = next((i for i, m in enumerate(hist) if m.get("mid") == tm), -1)
+            if idx >= 0 and hsh(history_projection(hist[:idx])) == upto:
+                hist = hist[:idx]
+                cur_hash = hsh(history_projection(hist))
+    if cur_hash != upto:
+        ta = cmd.get("truncate_after_mid")
+        if ta:
+            idx = next((i for i, m in enumerate(hist) if m.get("mid") == ta), -1)
+            if idx >= 0 and hsh(history_projection(hist[: idx + 1])) == upto:
+                hist = hist[: idx + 1]
+                cur_hash = hsh(history_projection(hist))
+    if cur_hash != upto:
+        tb = cmd.get("truncate_before_mid")
+        if tb:
+            idx = next((i for i, m in enumerate(hist) if m.get("mid") == tb), -1)
+            if idx >= 0 and hsh(history_projection(hist[:idx])) == upto:
+                hist = hist[:idx]
+                cur_hash = hsh(history_projection(hist))
+    if cur_hash != upto:
+        slog({"ev": "resync", "sid": sid, "hash": hsh(history_projection(hist))})
+        STORE["sessions"][sid] = {"history": hist}
+        save_store()
+        return
+
+    # media for THIS turn (files traveled with the command)
+    media_items = []
+    if cmd.get("media"):
+        for item in cmd["media"]:
+            local = fetch_media(item.get("file", ""))
+            if local:
+                item["_local"] = local
+                media_items.append(item)
+
+    for m in cmd.get("new_msgs", []):
+        entry = {"role": m["role"], "content": m["content"], "mid": m.get("mid")}
+        if m.get("mid") and str(m.get("mid")) == str(cmd.get("msg_id")) and media_items:
+            entry["media"] = [{"name": mi.get("name"), "kind": mi.get("kind"), "file": os.path.basename(mi.get("_local", ""))} for mi in media_items]
+        hist.append(entry)
+
+    # sliding window: keep under ~98% of the context window (chars estimate)
+    limit = int(CFG.get("contextTokens", 75000)) * 0.98 * CHARS_PER_TOKEN
+    def total_chars(h, syslen):
+        return syslen + sum(len(m["content"]) for m in h)
+    while total_chars(hist, len(cmd.get("system", ""))) > limit and len(hist) > 3:
+        hist.pop(0)
+
+    if cmd.get("memory_text") is not None and cmd.get("memory_hash") is not None:
+        if mem_state().get("hash") != cmd["memory_hash"]:
+            mem_state()["text"] = cmd["memory_text"]
+            mem_state()["hash"] = cmd["memory_hash"]
+
+    msgs = [{"role": "system", "content": cmd.get("system", "")}]
+    skills = cmd.get("skills") or []
+    if skills:
+        blocks = []
+        for s in skills:
+            b = "### Skill: " + s.get("title", "skill") + "\n"
+            if s.get("when"):
+                b += "When it applies: " + s["when"] + "\n"
+            if s.get("why"):
+                b += "Why it exists: " + s["why"] + "\n"
+            b += "---\n" + s.get("content", "") + "\n---"
+            blocks.append(b)
+        msgs.append({"role": "system", "content": SKILLS_HANDLER_PROMPT + "\n\nThe skills:\n\n" + "\n\n".join(blocks)})
+    if bool(CFG.get("memoryTools", False)):
+        msgs.append({"role": "system", "content": MEMORY_TOOLS_PROMPT})
+        log_lines = mem_state().get("log", [])
+        if log_lines:
+            msgs.append({"role": "system", "content": "Memory system results from your last operations:\n" + "\n".join(log_lines[-6:])})
+
+    # build the LLM message list (media attached to the current user turn;
+    # older media replaced with honest placeholders once the budget is spent)
+    budget = int(CFG.get("mediaBudget", 8000))
+    spent = 0
+    media_pending = {str(cmd.get("msg_id")): media_items} if media_items else {}
+    for m in hist:
+        key = str(m.get("mid"))
+        if key in media_pending:
+            m["_turn_media"] = media_pending[key]
+            spent += sum(IMAGE_TOKEN_EST if mi.get("kind") == "image" else 350 * int(CFG.get("visionMaxFrames", 8)) for mi in media_items)
+            continue
+        if m.get("media"):
+            if spent >= budget:
+                m["media_dropped"] = True
+                m.pop("_turn_media", None)
+            else:
+                ready = []
+                for mi in m.get("media", []):
+                    p = os.path.join(MEDIA_DIR, str(mi.get("file", "")))
+                    if os.path.exists(p):
+                        ready.append({**mi, "_local": p})
+                if ready:
+                    m["_turn_media"] = ready
+                    spent += sum(IMAGE_TOKEN_EST if mi.get("kind") == "image" else 350 * int(CFG.get("visionMaxFrames", 8)) for mi in ready)
+                else:
+                    m["media_dropped"] = True
+
+    llm_msgs = list(msgs)
+    for m in hist:
+        turn_media = m.pop("_turn_media", None)
+        text = m["content"]
+        if m.get("media_dropped") and m.get("role") == "user":
+            text = text + "\n\n[media from an earlier message was removed to leave room for the conversation]"
+            m["media_dropped"] = False
+        if turn_media and vision_ensure_loaded():
+            mm, est = build_media_message(text, turn_media, m.get("mid"))
+            llm_msgs.append(mm)
+        else:
+            if turn_media and not vision_available():
+                text = text + "\n\n[this message had images/video but vision is not available right now]"
+            llm_msgs.append({"role": m["role"], "content": text})
+
+    # persist new media so later turns can still see it
+    if media_items:
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+        for mi in media_items:
+            try:
+                dest = os.path.join(MEDIA_DIR, os.path.basename(mi["_local"]))
+                if not os.path.exists(dest):
+                    shutil.copyfile(mi["_local"], dest)
+            except Exception:
+                pass
+
+    slog({"ev": "gen-start", "sid": sid})
+    try:
+        result = generate(sid, llm_msgs, cmd.get("settings", {}),
+                          bool(cmd.get("thinking", True)), cmd.get("search"))
+    except Exception as e:
+        err("generate", e)
+        slog({"ev": "failed", "sid": sid, "d": str(e)[:300]})
+        outbox_push({"ev": "failed", "sid": sid, "v": cmd.get("v", 0), "d": str(e)[:300]})
+        return
+    mem_results = None
+    if bool(CFG.get("memoryTools", False)):
+        ops, cleaned = extract_memory_ops(result["content"])
+        if ops:
+            result["content"] = cleaned
+            mem_results, mem_changed = apply_memory_ops(ops)
+            if mem_changed:
+                save_store()
+    hist.append({"role": "assistant", "content": result["content"]})
+    STORE["sessions"][sid] = {"history": hist}
+    slog({"ev": "done", "sid": sid, "msg_id": cmd.get("msg_id"), "gen_ms": result["gen_ms"],
+          "out_tokens": result["out_tokens"], "chars": len(result["content"]),
+          "think_chars": len(result["thinking"] or ""), "search_brief": result["search_brief"],
+          "search_queries": result["search_queries"],
+          "mem_results": mem_results})
+    outbox_push({"ev": "done", "sid": sid, "v": cmd.get("v", 0), "gen_ms": result["gen_ms"],
+                 "chars": len(result["content"]), "think_chars": len(result["thinking"] or ""),
+                 "content": result["content"],
+                 "thinking": result["thinking"],
+                 "search_brief": result["search_brief"],
+                 "search_queries": result["search_queries"],
+                 "mem_results": mem_results})
+    save_store()
+
+def handle_edit_path(cmd):
+    sid = cmd["sid"]
+    hist = [{"role": m["role"], "content": m["content"], "mid": m.get("mid")} for m in cmd.get("history", [])]
+    STORE["sessions"][sid] = {"history": hist}
+    slog({"ev": "hash", "sid": sid, "hash": hsh(history_projection(hist))})
+    save_store()
+
+def handle_config(cmd):
+    patch = cmd.get("patch", {})
+    if "afkSeconds" in patch:
+        CFG["afkSeconds"] = max(60, int(patch["afkSeconds"]))
+    if "vision" in patch:
+        v = patch["vision"] or {}
+        CFG["visionEnabled"] = bool(v.get("enabled", False))
+        CFG["visionMaxFrames"] = int(v.get("maxFrames", CFG.get("visionMaxFrames", 8)))
+        CFG["visionFrameSeconds"] = int(v.get("frameSeconds", CFG.get("visionFrameSeconds", 2)))
+        CFG["mediaBudget"] = int(v.get("mediaTokenBudget", CFG.get("mediaBudget", 8000)))
+        if not CFG.get("visionEnabled", False):
+            vision_unload()
+        else:
+            VISION["failed"] = None
+    slog({"ev": "config", "patch": {k: CFG.get(k) for k in ("afkSeconds", "visionEnabled", "visionMaxFrames", "visionFrameSeconds", "mediaBudget")}})
 
 def dispatch(cmd):
     global SEEN_V, LAST_CMD
@@ -712,7 +1145,9 @@ def dispatch(cmd):
         outbox_push({"ev": "sleeping", "v": cmd.get("v", 0)})
         time.sleep(1)
         sys.exit(0)
-    if t == "chat":
+    if t == "config":
+        handle_config(cmd)
+    elif t == "chat":
         handle_chat(cmd)
     elif t == "edit_path":
         handle_edit_path(cmd)
@@ -729,8 +1164,11 @@ def dispatch(cmd):
 
 def main():
     global LAST_CMD
+    os.makedirs("/kaggle/tmp", exist_ok=True)
     load_store()
     boot_model()
+    if CFG.get("visionEnabled", False):
+        vision_check_ready()
     slog({"ev": "meta", "phase": "ready"})
     LAST_CMD = time.time()
     last_hb = time.time()

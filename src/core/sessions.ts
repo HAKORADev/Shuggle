@@ -42,6 +42,7 @@ export interface SessionData {
   searchEnabled: boolean;
   thinkingEnabled: boolean;
   memoryEnabled: boolean;
+  visionEnabled: boolean; // this chat may send images/videos (global master still gates it)
   override?: {
     systemPrompt?: string;
     temperature?: number;
@@ -49,6 +50,10 @@ export interface SessionData {
     maxOutputTokens?: number;
     searchMaxQueries?: number;
     searchPagesPerQuery?: number;
+    skillsEnabled?: boolean; // skills gate for this chat
+    disabledSkillIds?: string[];
+    languageMode?: "auto" | "device" | "manual";
+    languageCode?: string;
   };
   compareWith?: string | null; // dual-chat mode
   engineUsername?: string | null; // which token's engine this chat is bound to
@@ -68,6 +73,7 @@ export function newSession(name = "New chat"): SessionData {
     searchEnabled: false,
     thinkingEnabled: true,
     memoryEnabled: true,
+    visionEnabled: true,
     compareWith: null,
     engineUsername: null,
   };

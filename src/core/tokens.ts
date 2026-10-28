@@ -56,7 +56,7 @@ export async function poolAdd(
     existing.secret = secret;
     existing.state = "ok";
     existing.note = "replaced with a newer token for the same account";
-    return { ok: true, username, quota: await tryQuota(kaggle) };
+    return { ok: true, username, quota: (await tryQuota(kaggle)) ?? undefined };
   }
   if (pool.tokens.length >= MAX_TOKENS) {
     return { ok: false, username, error: `the pool is full (${MAX_TOKENS} tokens max)` };

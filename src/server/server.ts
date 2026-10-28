@@ -6,6 +6,7 @@ import { AppContext } from "../core/app.ts";
 import { newSession, activePath, addNode, renameAuto, switchDimension, branchOut, Msg, SessionData, childrenOf } from "../core/sessions.ts";
 import { buildSystemPrompt } from "../core/sysprompt.ts";
 import { mergeOverride } from "../core/settings.ts";
+import { activeSkills, skillsPrompt } from "../core/skills.ts";
 import { poolAdd, poolRefresh, poolSummary, poolAutoPick } from "../core/tokens.ts";
 import { hsh16 } from "../core/util.ts";
 
@@ -17,6 +18,12 @@ interface ChatTask {
   text: string;
   startedAt: number;
   chunks: { think: string; text: string };
+}
+
+interface IncomingMedia {
+  name: string;
+  kind: "image" | "video";
+  dataB64: string;
 }
 
 export class Server {
@@ -81,6 +88,9 @@ export class Server {
         const task = this.taskFor(ev.sid);
         if (!task) break;
         this.finalizeTask(task, ev);
+        if (ev.memResults?.length) {
+          this.broadcast("memory-chip", { sid: ev.sid, results: ev.memResults });
+        }
         break;
       }
       case "failed": {
@@ -107,6 +117,53 @@ export class Server {
       case "probe":
         this.broadcast("probe", { slot, ...ev });
         break;
+      case "outbox-done": {
+        // Durable turn completion from the engine's outbox. Normal flow: it
+        // backs up the live stream for the finalize step. Recovery flow: if
+        // the app (or the whole machine) restarted mid-generation, nobody is
+        // tracking this sid anymore — adopt the finished reply directly.
+        const j = ev;
+        this.app.lastOutboxBySid.set(j.sid, j);
+        if (!this.tasks.has(j.sid)) {
+          const s = this.app.sessions.sessions[j.sid];
+          if (s && j.content) {
+            const path = activePath(s);
+            const last = path.length ? path[path.length - 1] : null;
+            if (last && last.role === "assistant" && !last.content) {
+              last.content = j.content;
+              last.thinking = j.thinking ?? null;
+              last.genMs = j.gen_ms ?? null;
+              this.persist("sessions");
+              this.broadcast("done", { sid: j.sid, msgId: last.id, genMs: j.gen_ms ?? null, adopted: true });
+            } else if (!last || last.role === "user") {
+              const node = addNode(s, j.msg_id ?? (last?.id ?? null), {
+                role: "assistant",
+                content: j.content,
+                thinking: j.thinking ?? null,
+                genMs: j.gen_ms ?? null,
+                attachments: [],
+              });
+              this.persist("sessions");
+              this.broadcast("done", { sid: j.sid, msgId: node.id, genMs: j.gen_ms ?? null, adopted: true });
+            }
+          }
+        }
+        break;
+      }
+      case "vision":
+        this.broadcast("vision", { slot, state: ev.state, detail: ev.detail ?? null });
+        break;
+      case "mem": {
+        // Engine-side memory operations changed the memory text — mirror it.
+        if (typeof ev.text === "string") {
+          this.app.memory.text = ev.text;
+          this.persist("memory");
+          this.broadcast("memory-updated", { hash: ev.hash ?? null, text: ev.text });
+        } else {
+          this.broadcast("memory-touched", { hash: ev.hash ?? null });
+        }
+        break;
+      }
       case "seed":
         this.broadcast("seed", { slot, phase: ev.phase, detail: ev.detail });
         break;
@@ -166,7 +223,7 @@ export class Server {
     try {
       const slot = this.app.slots.get(slotUsername);
       if (!slot) return;
-      const entries = engineEntries(s);
+      const entries = engineEntries(activePath(s));
       await slot.resyncPath(s.id, entries);
     } catch {
       /* retried on next divergence */
@@ -277,15 +334,34 @@ export class Server {
           state: s.getState(),
           error: s.getError(),
           probe: s.getProbe(),
+          vision: s.getVision(),
         })),
+        skills: this.app.settings.skills ?? [],
       });
     }
 
-    // ---- settings
+    // ---- settings (vision/afk changes apply to live engines — no restart)
     if (path === "/api/settings" && method === "PUT") {
       const b = await req.json().catch(() => ({}));
+      const prevAfk = this.app.settings.afkMinutes;
+      const prevVision = JSON.stringify(this.app.settings.vision);
       this.app.settings = mergeUser(this.app.settings, b);
+      // Clamp skills through the settings module for safety.
+      this.app.settings = { ...this.app.settings, skills: this.app.settings.skills ?? [] };
       this.persist("settings");
+      if (this.app.settings.afkMinutes !== prevAfk || JSON.stringify(this.app.settings.vision) !== prevVision) {
+        for (const slot of this.app.slots.values()) {
+          void slot.configure({
+            afkSeconds: this.app.settings.afkMinutes * 60,
+            vision: {
+              enabled: this.app.settings.vision.enabled,
+              maxFrames: this.app.settings.vision.maxFrames,
+              frameSeconds: this.app.settings.vision.frameSeconds,
+              mediaTokenBudget: this.app.settings.mediaTokenBudget,
+            },
+          });
+        }
+      }
       return this.json({ ok: true, settings: this.app.settings });
     }
 
@@ -328,6 +404,7 @@ export class Server {
       const s = newSession(typeof b.name === "string" && b.name.trim() ? b.name.trim() : "New chat");
       s.searchEnabled = !!this.app.settings.searchEnabled;
       s.memoryEnabled = !!this.app.settings.memoryEnabled;
+      s.visionEnabled = !!this.app.settings.vision.enabled;
       this.app.sessions.sessions[s.id] = s;
       this.app.sessions.order = [s.id, ...this.app.sessions.order];
       this.persist("sessions");
@@ -354,6 +431,7 @@ export class Server {
           if (typeof b.searchEnabled === "boolean") s.searchEnabled = b.searchEnabled;
           if (typeof b.thinkingEnabled === "boolean") s.thinkingEnabled = b.thinkingEnabled;
           if (typeof b.memoryEnabled === "boolean") s.memoryEnabled = b.memoryEnabled;
+          if (typeof b.visionEnabled === "boolean") s.visionEnabled = b.visionEnabled;
           if (typeof b.compareWith === "string" || b.compareWith === null) s.compareWith = b.compareWith;
           if (b.override !== undefined) s.override = b.override;
           this.persist("sessions");
@@ -373,7 +451,7 @@ export class Server {
         }
         if (action === "send" && method === "POST") {
           const b = await req.json().catch(() => ({}));
-          return this.send(s, String(b.text ?? ""), Array.isArray(b.attachments) ? b.attachments : []);
+          return this.send(s, String(b.text ?? ""), Array.isArray(b.attachments) ? b.attachments : [], Array.isArray(b.media) ? (b.media as IncomingMedia[]) : []);
         }
         if (action === "retry" && method === "POST") {
           const b = await req.json().catch(() => ({}));
@@ -411,6 +489,19 @@ export class Server {
     }
 
     // ---- engine controls
+    if (path === "/api/engine/restart" && method === "POST") {
+      const b = await req.json().catch(() => ({}));
+      const user = String(b.username ?? "") || poolAutoPick(this.app.tokens)?.id;
+      const rec = this.app.tokens.tokens.find((t) => t.id === user);
+      if (!user || !rec) return this.fail("no such token");
+      try {
+        const slot = this.app.slotFor(user);
+        void slot.boot({ id: user, secret: rec.secret } as any, true);
+        return this.json({ ok: true, username: user });
+      } catch (e) {
+        return this.fail(e);
+      }
+    }
     if (path === "/api/engine/wake" && method === "POST") {
       const b = await req.json().catch(() => ({}));
       const user = String(b.username ?? "") || poolAutoPick(this.app.tokens)?.id;
@@ -513,7 +604,7 @@ export class Server {
     return { block: parts.join("\n\n"), meta };
   }
 
-  private async send(s: SessionData, text: string, attachments: any[]): Promise<Response> {
+  private async send(s: SessionData, text: string, attachments: any[], media: IncomingMedia[] = []): Promise<Response> {
     try {
       let full = text;
       let meta: any[] = [];
@@ -522,8 +613,31 @@ export class Server {
         meta = m;
         full = `${text}\n\n${block}`;
       }
-      if (!full.trim()) return this.fail("write something first");
+      if (!full.trim() && !media.length) return this.fail("write something first");
       if (this.tasks.has(s.id)) return this.json({ error: "still answering the previous message" }, 409);
+
+      // Media validation — honest refusals, never silent truncation.
+      const mediaFiles: { name: string; kind: "image" | "video"; file: string; bytes: Uint8Array }[] = [];
+      if (media.length) {
+        if (!this.app.settings.vision.enabled || !s.visionEnabled) {
+          return this.fail("vision is off — turn it on in Settings → Model (or this chat's toggle) to send images and videos");
+        }
+        const v = this.app.settings.vision;
+        if (media.length > v.maxImages) {
+          return this.fail(`up to ${v.maxImages} images/videos per message`);
+        }
+        for (const m of media) {
+          const bytes = Buffer.from(m.dataB64, "base64");
+          const capMB = m.kind === "video" ? v.videoMaxMB : v.imageMaxMB;
+          if (bytes.length > capMB * 1024 * 1024) {
+            return this.fail(`"${m.name}" is ${(bytes.length / 1024 / 1024).toFixed(1)} MB — the limit for ${m.kind === "video" ? "videos" : "images"} is ${capMB} MB`);
+          }
+          const safe = m.name.replace(/[^A-Za-z0-9._-]/g, "_").slice(-60) || (m.kind === "video" ? "video.mp4" : "image.jpg");
+          mediaFiles.push({ name: m.name.slice(0, 80), kind: m.kind, file: randomUUID().slice(0, 8) + "_" + safe, bytes: new Uint8Array(bytes) });
+        }
+        const note = mediaFiles.map((m) => (m.kind === "video" ? `[video: ${m.name}]` : `[image: ${m.name}]`)).join("\n");
+        full = `${full || "(see attachments)"}\n\n${note}`;
+      }
 
       const path = activePath(s);
       const uptoEntries = engineEntriesFrom(path, null);
@@ -537,14 +651,21 @@ export class Server {
         memoryText: this.app.memory.text,
         memoryEnabled: s.memoryEnabled,
         attachments: meta,
+        media: mediaFiles.map((m) => ({ name: m.name, kind: m.kind })),
       });
+      const skills = activeSkills(
+        this.app.settings.skills,
+        this.app.settings.skillsEnabled,
+        s.override?.skillsEnabled === undefined ? undefined : s.override.skillsEnabled,
+        s.override?.disabledSkillIds,
+      );
 
       const userNode = addNode(s, path.length ? path[path.length - 1].id : null, {
         role: "user",
         content: text,
         thinking: null,
         genMs: null,
-        attachments: meta,
+        attachments: [...meta, ...mediaFiles.map((m) => ({ name: m.name, size: m.bytes.length, chars: 0, media: m.kind }))],
       });
       renameAuto(s, text);
       this.persist("sessions");
@@ -570,6 +691,9 @@ export class Server {
         memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
         memoryText: s.memoryEnabled ? this.app.memory.text : null,
         thinking: s.thinkingEnabled,
+        skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
+        media: mediaFiles.length ? mediaFiles.map((m) => ({ name: m.name, kind: m.kind, file: m.file, bytes: m.bytes })) : undefined,
+        mediaForMid: mediaFiles.length ? userNode.id : null,
       });
 
       this.broadcast("session", { sid: s.id, reason: "user-added", msgId: userNode.id });
@@ -598,6 +722,12 @@ export class Server {
         memoryText: this.app.memory.text,
         memoryEnabled: s.memoryEnabled,
       });
+      const skills = activeSkills(
+        this.app.settings.skills,
+        this.app.settings.skillsEnabled,
+        s.override?.skillsEnabled === undefined ? undefined : s.override.skillsEnabled,
+        s.override?.disabledSkillIds,
+      );
 
       const task: ChatTask = {
         sid: s.id,
@@ -621,6 +751,7 @@ export class Server {
         memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
         memoryText: s.memoryEnabled ? this.app.memory.text : null,
         thinking: s.thinkingEnabled,
+        skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
       });
 
       this.broadcast("session", { sid: s.id, reason: "retry", userMsgId });
@@ -656,6 +787,12 @@ export class Server {
         memoryEnabled: s.memoryEnabled,
         attachments: meta,
       });
+      const skills = activeSkills(
+        this.app.settings.skills,
+        this.app.settings.skillsEnabled,
+        s.override?.skillsEnabled === undefined ? undefined : s.override.skillsEnabled,
+        s.override?.disabledSkillIds,
+      );
 
       // New sibling user node (a new dimension), active by default.
       const node = addNode(s, old.parentId, {
@@ -688,6 +825,7 @@ export class Server {
         memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
         memoryText: s.memoryEnabled ? this.app.memory.text : null,
         thinking: s.thinkingEnabled,
+        skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
       });
 
       this.persist("sessions");
@@ -729,6 +867,7 @@ export class Server {
       searchEnabled: s.searchEnabled,
       thinkingEnabled: s.thinkingEnabled,
       memoryEnabled: s.memoryEnabled,
+      visionEnabled: s.visionEnabled,
       compareWith: s.compareWith ?? null,
       messageCount: activePath(s).length,
     };

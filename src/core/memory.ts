@@ -19,6 +19,7 @@ export interface MemoryOp {
 
 export interface MemoryEntry {
   id: string;
+  name?: string;
   text: string;
   updatedAt: number;
   deleted?: boolean;
@@ -78,8 +79,9 @@ export function applyOp(
         return { ok: false, result: "memory is full — delete something first", text, history };
       }
       const id = Math.random().toString(36).slice(2, 8);
-      entries.push({ id, name: op.name || "note", text: op.content, updatedAt: Date.now() });
-      history.push({ id, name: op.name || "note", text: op.content, updatedAt: Date.now() });
+      const entry: MemoryEntry = { id, name: op.name || "note", text: op.content, updatedAt: Date.now() };
+      entries.push(entry);
+      history.push({ ...entry });
       return { ok: true, result: `created memory #${id}`, text: serializeMemory(entries), history };
     }
     case "edit": {
@@ -126,18 +128,14 @@ export function applyOp(
       if (!del) return { ok: false, result: "nothing to undo", text, history };
       del.deleted = false;
       del.deletedAt = undefined;
-      return { ok: true, result: `restored memory #${del.id}`, text: serializeMemory(parseMemoryBlocks(del.text) ? serializeMemory(rebuild(entries, history)) : entries), history };
+      const restored = history
+        .filter((h) => !h.deleted)
+        .map((h) => ({ id: h.id, name: h.name ?? "note", text: h.text, updatedAt: h.updatedAt }));
+      return { ok: true, result: `restored memory #${del.id}`, text: serializeMemory(restored), history };
     }
     default:
       return { ok: false, result: "unknown op", text, history };
   }
-}
-
-function rebuild(entries: MemoryEntry[], history: MemoryEntry[]): MemoryEntry[] {
-  // Rebuild live entries from history (source of truth).
-  return history
-    .filter((h) => !h.deleted)
-    .map((h) => ({ id: h.id, name: h.name, text: h.text, updatedAt: h.updatedAt }));
 }
 
 /** Extract and strip memory op blocks from model output (```memory ... ```). */
