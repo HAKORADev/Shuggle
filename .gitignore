@@ -1,8 +1,6 @@
-build*/
-.cache/
-compile_commands.json
-*.user
-.DS_Store
-vcpkg_installed/
+data/
+build/
 out/
-shuggle-data/
+node_modules/
+*.log
+.DS_Store

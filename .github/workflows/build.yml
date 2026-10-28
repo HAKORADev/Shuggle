@@ -1,0 +1,62 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Bundle UI
+        run: bun build src/ui/app.ts --minify --format=iife --outfile=src/ui/app.bundle.js
+      - name: Compile single binary
+        run: bun build src/shuggle.ts --compile --minify --bytecode --outfile=shuggle
+      - name: Smoke test
+        run: |
+          ./shuggle version
+          ./shuggle help | head -5
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shuggle-linux-x64
+          path: shuggle
+          compression-level: 9
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Bundle UI
+        run: bun build src/ui/app.ts --minify --format=iife --outfile=src/ui/app.bundle.js
+      - name: Compile single binary
+        shell: bash
+        run: bun build src/shuggle.ts --compile --minify --bytecode --windows-icon=assets/shuggle.ico --windows-hide-console --windows-title="Shuggle" --windows-publisher="HAKORA" --windows-version="0.5.0.0" --windows-description="Free chats on free GPUs" --outfile=Shuggle.exe
+      - name: Smoke test
+        shell: bash
+        run: |
+          ./Shuggle.exe version
+          ./Shuggle.exe help | head -5
+      - name: Prepare folder (exe + launchers)
+        shell: bash
+        run: |
+          mkdir -p bundle
+          cp Shuggle.exe bundle/
+          cp launcher/"Shuggle.bat" bundle/
+          cp launcher/"Shuggle LAN.bat" bundle/
+          cp launcher/shuggle.sh bundle/
+          cp launcher/shuggle-lan.sh bundle/
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shuggle-windows-x64
+          path: bundle/
+          compression-level: 9
