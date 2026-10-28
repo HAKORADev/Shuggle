@@ -126,7 +126,8 @@ export class EngineSlot {
       this.state = s;
       this.transitions.push(`${new Date().toISOString().slice(11, 19)} ${from}->${s}${detail ? " (" + detail + ")" : ""}`);
       if (this.transitions.length > 12) this.transitions.shift();
-      console.log(`[engine ${this.username}] ${from} -> ${s}${detail ? " — " + detail : ""}`);
+      console.log(`[engine ${this.username}] ${new Date().toISOString().slice(11, 19)} ${from} -> ${s}${detail ? " — " + detail : ""}`);
+      if (s === "sleeping" || s === "error") console.log(new Error().stack?.split("\n").slice(1, 5).join("\n"));
       this.emit("state", { state: s, detail });
     }
   }

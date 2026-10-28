@@ -363,19 +363,29 @@ def boot_model():
             path = local
             slog({"ev": "meta", "phase": "model-local", "detail": "already on engine disk"})
         else:
-            slog({"ev": "meta", "phase": "model-copy", "detail": "storing on engine disk"})
+            # Copy only when the working folder can actually hold the model —
+            # otherwise load straight from the mount (still fast).
             try:
-                path = copy_progress(mounted, local, "model")
-                slog({"ev": "meta", "phase": "model-copied", "detail": round(os.path.getsize(path) / 1e9, 1)})
-            except OSError as e:
-                # working folder is full — load straight from the mount instead
-                err("model-copy", e)
-                try:
-                    if os.path.exists(local):
-                        os.remove(local)
-                except Exception:
-                    pass
+                free = os.statvfs(WORK).f_bavail * os.statvfs(WORK).f_frsize
+            except Exception:
+                free = 0
+            need = os.path.getsize(mounted) + 2 * 1024 * 1024 * 1024
+            if free < need:
+                slog({"ev": "meta", "phase": "model-local", "detail": "loading from mounted storage"})
                 path = mounted
+            else:
+                slog({"ev": "meta", "phase": "model-copy", "detail": "storing on engine disk"})
+                try:
+                    path = copy_progress(mounted, local, "model")
+                    slog({"ev": "meta", "phase": "model-copied", "detail": round(os.path.getsize(path) / 1e9, 1)})
+                except OSError as e:
+                    err("model-copy", e)
+                    try:
+                        if os.path.exists(local):
+                            os.remove(local)
+                    except Exception:
+                        pass
+                    path = mounted
     else:
         slog({"ev": "meta", "phase": "model-download-fallback"})
         # /kaggle/tmp — big VM disk, NOT the quota-limited working folder
@@ -640,6 +650,7 @@ def generate(sid, messages, settings, thinking, search_cfg):
     gen_ms = int((time.time() - t0) * 1000)
     thinking_out = sp.think_full if (sp.done_think or sp.explicit) and not reclass else None
     content_out = sp.text_full if not reclass else (sp.think_full + sp.text_full)
+    content_out = content_out.lstrip("\n")
     if reclass:
         slog({"ev": "reclass", "sid": sid})
     return {
