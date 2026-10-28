@@ -76,9 +76,16 @@ export class EngineSlot {
   private visionState: VisionState = "unknown";
   private visionDetail: string | null = null;
   private bootGraceUntil = 0;
+  private pushedAt = 0;
   private lastSseAt = 0;
   private recovering = false;
   private lastCmdSentAt = 0;
+
+  /** True when the relay has fresh evidence (log lines) from the session we
+   *  pushed — past that point, COMPLETE/ERROR from the status API is real. */
+  private get freshSessionEvidence(): boolean {
+    return this.pushedAt > 0 && this.lastSseAt > this.pushedAt;
+  }
 
   constructor(opts: { username: string; secret: string; profile: string; contextTokens: number; afkSeconds: number; events: EventEmitter }) {
     this.username = opts.username;
@@ -212,10 +219,11 @@ export class EngineSlot {
     });
     this.slug = res.slug;
     this.resetRuntime();
-    // The status API can lag the push (it still reports the previous session's
-    // COMPLETE/ERROR while the new one is QUEUED). Grace period stops the
-    // relay from shutting down during that window.
-    this.bootGraceUntil = Date.now() + 150_000;
+    // The status API keeps reporting the PREVIOUS session's COMPLETE/ERROR
+    // for the entire queued-boot window (minutes). Shutdown on those is only
+    // allowed after the grace period AND without fresh log evidence.
+    this.pushedAt = Date.now();
+    this.bootGraceUntil = Date.now() + 600_000;
     this.lastSseAt = Date.now();
     await this.attachStreams();
   }
@@ -300,14 +308,14 @@ export class EngineSlot {
         try {
           const st = await this.kaggle.kernelStatus(this.username, this.slug);
           if (st.status === "COMPLETE" || st.status === "ERROR" || st.status === "CANCEL_ACKNOWLEDGED") {
-            if (Date.now() < this.bootGraceUntil) return; // push lag — the new session is on its way
+            if (!this.freshSessionEvidence && Date.now() < this.bootGraceUntil) return;
             this.setState(st.status === "ERROR" ? "error" : "sleeping", st.status === "ERROR" ? "The engine hit a problem" : "Your engine is resting");
             if (st.status === "ERROR") this.lastError = st.failureMessage ?? "engine error";
             this.stopTimers();
             return;
           }
-          // Zombie watch: RUNNING but the log stream went silent for a long time.
-          if (st.status === "RUNNING" && this.lastSseAt > 0 && Date.now() - this.lastSseAt > 8 * 60_000 && this.state !== "generating") {
+          // Zombie watch: a session we SAW producing output went silent.
+          if (st.status === "RUNNING" && this.freshSessionEvidence && this.lastSseAt > 0 && Date.now() - this.lastSseAt > 8 * 60_000 && this.state !== "generating") {
             this.recovering = true;
             this.setState("booting", "Clearing a stuck engine session");
             this.stopTimers();
@@ -395,7 +403,7 @@ export class EngineSlot {
       try {
         const st = await this.kaggle.kernelStatus(this.username, this.slug);
         const alive = st.status === "RUNNING" || st.status === "QUEUED" || st.status === "INITIALIZING";
-        if (!alive && Date.now() >= this.bootGraceUntil) {
+        if (!alive && (this.freshSessionEvidence || Date.now() >= this.bootGraceUntil)) {
           if (st.status === "COMPLETE") this.setState("sleeping", "Your engine is resting");
           if (st.status === "ERROR") {
             this.setState("error", "The engine hit a problem");
