@@ -337,7 +337,18 @@ export class EngineSlot {
           if (j.sid) this.generating.delete(j.sid);
           if (j.last_done?.sid) this.generating.delete(j.last_done.sid);
         } else if (j.ev === "sleeping") {
-          this.setState("sleeping", "Your engine is resting");
+          // Stale payload guard: a just-pushed session means this "sleeping"
+          // belongs to a previous run — confirm with the live status first.
+          void (async () => {
+            try {
+              const st = await this.kaggle.kernelStatus(this.username, this.slug);
+              if ((st.status !== "RUNNING" && st.status !== "QUEUED") && Date.now() >= this.bootGraceUntil) {
+                this.setState("sleeping", "Your engine is resting");
+              }
+            } catch {
+              /* keep current state */
+            }
+          })();
         }
       } catch {
         /* not ready */

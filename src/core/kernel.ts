@@ -1169,6 +1169,10 @@ def dispatch(cmd):
 def main():
     global LAST_CMD
     os.makedirs("/kaggle/tmp", exist_ok=True)
+    # announce the fresh session in the outbox — this overwrites any stale
+    # sleeping/done payload from a previous session so the app never reads
+    # outdated state after a reboot
+    outbox_push({"ev": "booting"})
     load_store()
     boot_model()
     if CFG.get("visionEnabled", False):
