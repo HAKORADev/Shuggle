@@ -4,3 +4,6 @@ out/
 node_modules/
 *.log
 .DS_Store
+shuggle
+ShuggleData/
+app.bundle.js
