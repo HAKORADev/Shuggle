@@ -53,9 +53,8 @@ export class Server {
         this.broadcast("engine", { slot, state: ev.state, detail: ev.detail });
         break;
       case "chunk": {
-        const task = [...this.tasks.values()].find((t) => t.assistantMsgId && ev.sid === t.sid);
+        const task = this.taskFor(ev.sid);
         if (!task) break;
-        if (!task.assistantMsgId) break;
         task.chunks[ev.kind === "think" ? "think" : "text"] += ev.text;
         this.ensureAssistantNode(task);
         this.broadcast("chunk", {
