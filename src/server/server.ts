@@ -99,6 +99,19 @@ export class Server {
     switch (ev.type) {
       case "state":
         this.broadcast("engine", { slot, state: ev.state, detail: ev.detail });
+        // One-shot rescue: the engine just came up but a queued turn may have
+        // been overwritten by a ping in the inbox — re-send it once.
+        if (ev.state === "ready") {
+          for (const task of this.tasks.values()) {
+            if (task.slot !== slot || (task as any).rescued) continue;
+            if (!task.turn || Date.now() - task.startedAt < 30_000) continue;
+            (task as any).rescued = true;
+            const slotObj = this.app.slots.get(slot);
+            if (slotObj) {
+              void slotObj.wakeAndSend(task.turn).catch(() => {});
+            }
+          }
+        }
         break;
       case "chunk": {
         const task = this.taskFor(ev.sid);
@@ -1033,11 +1046,36 @@ export class Server {
   // ===================================================================
 
   startPings(): void {
+    this.startTaskWatchdog();
     if (this.pingTimer) return;
     this.pingTimer = setInterval(() => {
-      // Keep engines awake only while the user is actually active.
+      // Keep engines awake only while the user is actually active AND no
+      // chat turn is pending — a ping would overwrite a queued command in
+      // the single-file inbox.
       if (Date.now() - this.lastActivity < 150_000) {
-        for (const slot of this.app.slots.values()) void slot.ping();
+        for (const slot of this.app.slots.values()) {
+          const busy = [...this.tasks.values()].some((t) => t.slot === slot.username);
+          if (!busy) void slot.ping();
+        }
+      }
+    }, 60_000);
+  }
+
+  /** A turn that never completes must not block the chat forever. */
+  private taskWatchdog: NodeJS.Timeout | null = null;
+  private startTaskWatchdog(): void {
+    if (this.taskWatchdog) return;
+    this.taskWatchdog = setInterval(() => {
+      for (const [sid, task] of this.tasks) {
+        if (Date.now() - task.startedAt > 15 * 60_000) {
+          this.tasks.delete(sid);
+          const s = this.app.sessions.sessions[sid];
+          if (s && task.userMsgId && s.nodes[task.userMsgId]) {
+            s.nodes[task.userMsgId].error = "This reply took too long and was dropped — the engine may be overloaded. Send it again.";
+          }
+          this.persist("sessions");
+          this.broadcast("failed", { sid, msgId: task.assistantMsgId, detail: "task timeout" });
+        }
       }
     }, 60_000);
   }

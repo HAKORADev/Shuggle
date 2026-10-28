@@ -125,6 +125,19 @@ export class EngineSlot {
 
   /** Ensure the private relay datasets exist. Cheap (one status check each). */
   private async ensureDatasets(): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.ensureDatasetsOnce();
+        return;
+      } catch (e: any) {
+        if (attempt === 2) throw e;
+        dbg(`ensureDatasets: ${String(e?.message ?? e).slice(0, 80)} — retrying`);
+        await sleep(6000 * (attempt + 1));
+      }
+    }
+  }
+
+  private async ensureDatasetsOnce(): Promise<void> {
     const jobs: [string, string, string][] = [
       [`shuggle-inbox-${this.ns}`, "Shuggle Inbox", "Shuggle command relay for the Shuggle engine. Managed automatically."],
       [`shuggle-outbox-${this.ns}`, "Shuggle Outbox", "Shuggle response relay for the Shuggle engine. Managed automatically."],
@@ -152,6 +165,19 @@ export class EngineSlot {
   }
 
   private async bootInner(record: TokenRecord, force = false): Promise<void> {
+    // Hard ceiling — a hung boot must never wedge the slot forever.
+    return await Promise.race([
+      this.bootSteps(record, force),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("boot timed out — Kaggle is slow right now, try again")), 10 * 60_000)
+      ).catch((e) => {
+        this.setState("error", "The engine could not start — try again in a minute");
+        throw e;
+      }),
+    ]);
+  }
+
+  private async bootSteps(record: TokenRecord, force = false): Promise<void> {
     this.lastError = null;
     dbg(`boot: state=${this.state}`);
     const st = await this.kaggle.kernelStatus(this.username, this.slug);
@@ -591,7 +617,10 @@ export class EngineSlot {
   }
 
   async ping(): Promise<void> {
-    if (this.state === "ready" || this.state === "generating" || this.state === "booting") {
+    // Pings only while the loop is live. During boot they are useless (the
+    // engine's own AFK clock starts when it boots) and dangerous — a ping
+    // would overwrite a queued chat command in the single-file inbox.
+    if (this.state === "ready" || this.state === "generating") {
       try {
         await this.sendCmd({ type: "stay" });
       } catch {
