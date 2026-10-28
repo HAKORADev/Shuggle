@@ -231,34 +231,20 @@ SEEN_V = 0
 def read_cmd():
     global SEEN_V
     try:
-<<<<<<< HEAD
-        raw = _download_bytes(OWNER, INBOX_SLUG, "cmd.json", timeout=30)
+        for _attempt in range(3):
+            try:
+                raw = _download_bytes(OWNER, INBOX_SLUG, "cmd.json", timeout=30)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and _attempt < 2:
+                    time.sleep(4)
+                    continue
+                return None
+            except Exception:
+                return None
+        else:
+            return None
         cmd = json.loads(raw.decode())
-=======
-        req = urllib.request.Request(
-            BASE + "/datasets.DatasetApiService/DownloadDataset",
-            data=json.dumps({"ownerSlug": OWNER, "datasetSlug": INBOX_SLUG, "fileName": "cmd.json", "raw": True}).encode(),
-            headers={"Authorization": "Bearer " + CFG["bearer"], "Content-Type": "application/json"},
-            method="POST",
-        )
-        class NR(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *a, **k):
-                return None
-        op = urllib.request.build_opener(NR)
-        try:
-            r = op.open(req, timeout=30)
-            raw = r.read().decode()
-        except urllib.error.HTTPError as e:
-            if e.status in (301, 302, 303, 307, 308):
-                with urllib.request.urlopen(e.headers["Location"], timeout=30) as r2:
-                    raw = r2.read().decode()
-            elif e.code == 429:
-                time.sleep(4)
-                return None
-            else:
-                return None
-        cmd = json.loads(raw)
->>>>>>> 9056727 (v2 hardening from live E2E: envelope parsing, monotonic cmd versions, resync continuation, one-server lock, rate-limit resilience, dimension directions)
         if not isinstance(cmd, dict):
             return None
         if cmd.get("v", 0) <= SEEN_V:
