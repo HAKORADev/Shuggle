@@ -80,12 +80,10 @@ export class EngineSlot {
   private lastSseAt = 0;
   private recovering = false;
   private lastCmdSentAt = 0;
-
-  /** True when the relay has fresh evidence (log lines) from the session we
-   *  pushed — past that point, COMPLETE/ERROR from the status API is real. */
-  private get freshSessionEvidence(): boolean {
-    return this.pushedAt > 0 && this.lastSseAt > this.pushedAt;
-  }
+  /** True right after a push: every terminal event seen in the stream is a
+   *  replay of the previous session until a booting event arrives LATE
+   *  (replays land instantly; a fresh session takes minutes to start). */
+  private awaitingFreshBoot = false;
 
   constructor(opts: { username: string; secret: string; profile: string; contextTokens: number; afkSeconds: number; events: EventEmitter }) {
     this.username = opts.username;
@@ -124,10 +122,15 @@ export class EngineSlot {
 
   private setState(s: SlotState, detail?: string): void {
     if (this.state !== s) {
+      const from = this.state;
       this.state = s;
+      this.transitions.push(`${new Date().toISOString().slice(11, 19)} ${from}->${s}${detail ? " (" + detail + ")" : ""}`);
+      if (this.transitions.length > 12) this.transitions.shift();
+      console.log(`[engine ${this.username}] ${from} -> ${s}${detail ? " — " + detail : ""}`);
       this.emit("state", { state: s, detail });
     }
   }
+  transitions: string[] = [];
 
   /** Ensure the private relay datasets exist. Cheap (one status check each). */
   private async ensureDatasets(): Promise<void> {
@@ -219,12 +222,10 @@ export class EngineSlot {
     });
     this.slug = res.slug;
     this.resetRuntime();
-    // The status API keeps reporting the PREVIOUS session's COMPLETE/ERROR
-    // for the entire queued-boot window (minutes). Shutdown on those is only
-    // allowed after the grace period AND without fresh log evidence.
     this.pushedAt = Date.now();
-    this.bootGraceUntil = Date.now() + 600_000;
+    this.bootGraceUntil = Date.now() + 900_000;
     this.lastSseAt = Date.now();
+    this.awaitingFreshBoot = true;
     await this.attachStreams();
   }
 
@@ -308,14 +309,14 @@ export class EngineSlot {
         try {
           const st = await this.kaggle.kernelStatus(this.username, this.slug);
           if (st.status === "COMPLETE" || st.status === "ERROR" || st.status === "CANCEL_ACKNOWLEDGED") {
-            if (!this.freshSessionEvidence && Date.now() < this.bootGraceUntil) return;
+            if (this.awaitingFreshBoot) return; // status lag — still reporting the previous session
             this.setState(st.status === "ERROR" ? "error" : "sleeping", st.status === "ERROR" ? "The engine hit a problem" : "Your engine is resting");
             if (st.status === "ERROR") this.lastError = st.failureMessage ?? "engine error";
             this.stopTimers();
             return;
           }
           // Zombie watch: a session we SAW producing output went silent.
-          if (st.status === "RUNNING" && this.freshSessionEvidence && this.lastSseAt > 0 && Date.now() - this.lastSseAt > 8 * 60_000 && this.state !== "generating") {
+          if (st.status === "RUNNING" && !this.awaitingFreshBoot && this.lastSseAt > 0 && Date.now() - this.lastSseAt > 8 * 60_000 && this.state !== "generating") {
             this.recovering = true;
             this.setState("booting", "Clearing a stuck engine session");
             this.stopTimers();
@@ -403,7 +404,7 @@ export class EngineSlot {
       try {
         const st = await this.kaggle.kernelStatus(this.username, this.slug);
         const alive = st.status === "RUNNING" || st.status === "QUEUED" || st.status === "INITIALIZING";
-        if (!alive && (this.freshSessionEvidence || Date.now() >= this.bootGraceUntil)) {
+        if (!alive && !this.awaitingFreshBoot) {
           if (st.status === "COMPLETE") this.setState("sleeping", "Your engine is resting");
           if (st.status === "ERROR") {
             this.setState("error", "The engine hit a problem");
@@ -424,8 +425,12 @@ export class EngineSlot {
     switch (j.ev) {
       case "meta":
         if (j.phase === "ready") {
+          this.awaitingFreshBoot = false;
           this.setState("ready");
         } else if (["booting", "installing-deps", "finding-model", "model-copy", "model-copied", "model-local", "loading-model", "model-from-dataset", "model-download-fallback", "store-loaded", "model-ready"].includes(j.phase)) {
+          // A booting event arriving long after the push is the NEW session's
+          // — replays land within seconds of connecting.
+          if (Date.now() - this.pushedAt > 60_000) this.awaitingFreshBoot = false;
           if (this.state !== "generating") this.setState("booting", humanBootPhase(j.phase, j.detail));
         }
         break;
@@ -504,6 +509,7 @@ export class EngineSlot {
         this.emit("search", { sid: j.sid, phase: j.phase, data: j.data ?? null });
         break;
       case "sleeping": {
+        if (this.awaitingFreshBoot) break; // replay from the previous session
         // The log replays past sessions — confirm with the live status before
         // believing an afk-stop.
         void (async () => {

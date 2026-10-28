@@ -358,6 +358,7 @@ export class Server {
           error: s.getError(),
           probe: s.getProbe(),
           vision: s.getVision(),
+          transitions: (s as any).transitions ?? [],
         })),
         skills: this.app.settings.skills ?? [],
       });
