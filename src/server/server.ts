@@ -159,8 +159,10 @@ export class Server {
               last.thinking = target.thinking ?? null;
               last.genMs = target.gen_ms ?? null;
               fill(last.id);
-            } else if (!last || last.role === "user") {
-              const node = addNode(s, target.msg_id ?? (last?.id ?? null), {
+            } else if (last && last.role === "user" && last.id === (target.msg_id ?? last.id)) {
+              // Only adopt when the finished turn answers THIS pending message —
+              // a stale outbox payload must never masquerade as a new reply.
+              const node = addNode(s, last.id, {
                 role: "assistant",
                 content: target.content,
                 thinking: target.thinking ?? null,
