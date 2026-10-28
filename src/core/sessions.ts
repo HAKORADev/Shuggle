@@ -135,13 +135,13 @@ export function addNode(s: SessionData, parentId: string | null, msg: Omit<Msg, 
 }
 
 /** Switch the active dimension of a node (for switching between retries/edits). */
-export function switchDimension(s: SessionData, nodeId: string): boolean {
+export function switchDimension(s: SessionData, nodeId: string, dir: 1 | -1 = 1): boolean {
   const node = s.nodes[nodeId];
   if (!node) return false;
   const siblings = childrenOf(s, node.parentId);
   const i = siblings.findIndex((x) => x.id === node.id);
   if (i < 0 || siblings.length < 2) return false;
-  const next = siblings[(i + 1) % siblings.length];
+  const next = siblings[(i + dir + siblings.length) % siblings.length];
   if (node.parentId === null) s.activeRoot = next.id;
   else s.activeChild[node.parentId] = next.id;
   return true;

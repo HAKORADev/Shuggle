@@ -56,6 +56,10 @@ export async function runOneLine(opts: { dataDir: string; args: string[] }): Pro
     const full = (await a.get(`/api/sessions/${target.id}`)) as any;
     const sess = full?.session;
     if (!sess) break;
+    if (r.userMsgId && sess.nodes[r.userMsgId]?.error) {
+      console.error(`  ${sess.nodes[r.userMsgId].error}`);
+      process.exit(1);
+    }
     const ids: string[] = [];
     let cur = sess.activeRoot;
     while (cur) {

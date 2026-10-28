@@ -2,6 +2,7 @@
 
 import { join, extname } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { AppContext } from "../core/app.ts";
 import { newSession, activePath, addNode, renameAuto, switchDimension, branchOut, Msg, SessionData, childrenOf } from "../core/sessions.ts";
 import { buildSystemPrompt } from "../core/sysprompt.ts";
@@ -18,6 +19,8 @@ interface ChatTask {
   text: string;
   startedAt: number;
   chunks: { think: string; text: string };
+  turn?: any; // the exact wakeAndSend payload, for resync continuation
+  slot?: string;
 }
 
 interface IncomingMedia {
@@ -39,6 +42,44 @@ export class Server {
   ) {
     this.app = new AppContext(opts.dataDir);
     this.app.events.on("engine", (ev: any) => this.onEngineEvent(ev));
+  }
+
+  /**
+   * One data dir, one server. Whoever owns <dataDir>/server.json owns the
+   * state; a second server on the same folder would silently fork the
+   * encrypted vault — so we either adopt the running one or take the lock.
+   * Returns the port of the live server (ours or the existing one).
+   */
+  static async claimLock(dataDir: string, port: number, pid: number): Promise<{ port: number; existing: boolean }> {
+    const lockFile = join(dataDir, "server.json");
+    const { existsSync, readFileSync, writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(dataDir, { recursive: true });
+    if (existsSync(lockFile)) {
+      try {
+        const { port: p, pid: ownerPid } = JSON.parse(readFileSync(lockFile, "utf8"));
+        // is it alive?
+        const alive = await fetch(`http://127.0.0.1:${p}/api/health`, { signal: AbortSignal.timeout(2500) })
+          .then((r) => r.ok)
+          .catch(() => false);
+        if (alive) return { port: p, existing: true };
+      } catch {
+        /* stale — take over */
+      }
+    }
+    writeFileSync(lockFile, JSON.stringify({ port, pid }));
+    return { port, existing: false };
+  }
+
+  static releaseLock(dataDir: string, pid: number): void {
+    const lockFile = join(dataDir, "server.json");
+    try {
+      if (existsSync(lockFile)) {
+        const j = JSON.parse(readFileSync(lockFile, "utf8"));
+        if (j.pid === pid) unlinkSync(lockFile);
+      }
+    } catch {
+      /* best effort */
+    }
   }
 
   // ===================================================================
@@ -106,12 +147,26 @@ export class Server {
         break;
       }
       case "resync": {
-        // The engine's history diverged — push the active path fully.
+        // The engine's history diverged — push the active path fully, then
+        // continue the pending turn (the engine skips generation on resync).
+        // One continuation per task: replayed resync events must not re-fire.
         const task = this.taskFor(ev.sid);
-        if (!task) break;
+        if (!task || (task as any).continuing) break;
+        (task as any).continuing = true;
         const s = this.app.sessions.sessions[task.sid];
         if (!s) break;
-        void this.pushFullPath(ev.slot, s);
+        void (async () => {
+          try {
+            const slot = this.app.slots.get(task.slot ?? ev.slot ?? "");
+            if (!slot) return;
+            await slot.resyncPath(task.sid, engineEntries(activePath(s)));
+            if (task.turn) await slot.wakeAndSend(task.turn);
+            (task as any).continuing = false;
+          } catch (e: any) {
+            this.tasks.delete(task.sid);
+            this.broadcast("failed", { sid: task.sid, msgId: task.userMsgId, detail: e?.message ?? String(e) });
+          }
+        })();
         break;
       }
       case "probe":
@@ -373,7 +428,7 @@ export class Server {
       try {
         const r = await poolAdd(this.app.tokens, secret);
         if (!r.ok) return this.fail(r.error);
-        this.persist("tokens");
+        this.app.save("tokens", 0);
         return this.json({ ok: true, username: r.username, quota: r.quota });
       } catch (e) {
         return this.fail(e);
@@ -383,7 +438,7 @@ export class Server {
       const b = await req.json().catch(() => ({}));
       const user = String(b.username ?? "");
       const rec = await poolRefresh(this.app.tokens, user);
-      this.persist("tokens");
+      this.app.save("tokens", 0);
       if (!rec) return this.fail("no such token");
       return this.json({ ok: true, token: poolSummary(this.app.tokens).find((t) => t.id === user) });
     }
@@ -391,7 +446,7 @@ export class Server {
       const b = await req.json().catch(() => ({}));
       const user = String(b.username ?? "");
       this.app.tokens.tokens = this.app.tokens.tokens.filter((t) => t.id !== user);
-      this.persist("tokens");
+      this.app.save("tokens", 0);
       return this.json({ ok: true });
     }
 
@@ -463,7 +518,7 @@ export class Server {
         }
         if (action === "switch" && method === "POST") {
           const b = await req.json().catch(() => ({}));
-          return this.switchDim(s, String(b.msgId ?? ""));
+          return this.switchDim(s, String(b.msgId ?? ""), b.dir === -1 ? -1 : 1);
         }
         if (action === "branch" && method === "POST") {
           const b = await req.json().catch(() => ({}));
@@ -484,7 +539,7 @@ export class Server {
         return this.fail(`memories are limited to ${this.app.settings.memoryMaxChars} characters`);
       }
       this.app.memory.text = text;
-      this.persist("memory");
+      this.app.save("memory", 0);
       return this.json({ ok: true });
     }
 
@@ -642,8 +697,6 @@ export class Server {
       const path = activePath(s);
       const uptoEntries = engineEntriesFrom(path, null);
       const uptoHash = hsh16(uptoEntries);
-
-      const slot = await this.app.ensureEngine(s);
       const g = mergeOverride(this.app.settings, s.override);
       const system = s.override?.systemPrompt ?? buildSystemPrompt({
         settings: this.app.settings,
@@ -680,23 +733,40 @@ export class Server {
         chunks: { think: "", text: "" },
       };
       this.tasks.set(s.id, task);
-
-      await slot.wakeAndSend({
-        sid: s.id,
-        uptoHash,
-        newMsgs: [{ role: "user", content: full, mid: userNode.id }],
-        system,
-        settings: { temperature: g.temperature, top_p: g.topP, max_tokens: g.maxOutputTokens },
-        search: { enabled: s.searchEnabled, max_queries: g.searchMaxQueries, pages_per_query: g.searchPagesPerQuery },
-        memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
-        memoryText: s.memoryEnabled ? this.app.memory.text : null,
-        thinking: s.thinkingEnabled,
-        skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
-        media: mediaFiles.length ? mediaFiles.map((m) => ({ name: m.name, kind: m.kind, file: m.file, bytes: m.bytes })) : undefined,
-        mediaForMid: mediaFiles.length ? userNode.id : null,
-      });
-
       this.broadcast("session", { sid: s.id, reason: "user-added", msgId: userNode.id });
+
+      // The engine boot can take minutes — accept now, work in the background.
+      void (async () => {
+        try {
+          if (process.env.SHUGGLE_DEBUG) console.error(`[send] background task started for ${s.id.slice(0, 8)}`);
+          const slot = await this.app.ensureEngine(s);
+          if (process.env.SHUGGLE_DEBUG) console.error(`[send] engine slot ready: ${slot.username} state=${slot.getState()}`);
+          task.slot = slot.username;
+          const turn = {
+            sid: s.id,
+            uptoHash,
+            newMsgs: [{ role: "user", content: full, mid: userNode.id }],
+            system,
+            settings: { temperature: g.temperature, top_p: g.topP, max_tokens: g.maxOutputTokens },
+            search: { enabled: s.searchEnabled, max_queries: g.searchMaxQueries, pages_per_query: g.searchPagesPerQuery },
+            memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
+            memoryText: s.memoryEnabled ? this.app.memory.text : null,
+            thinking: s.thinkingEnabled,
+            skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
+            media: mediaFiles.length ? mediaFiles.map((m) => ({ name: m.name, kind: m.kind, file: m.file, bytes: m.bytes })) : undefined,
+            mediaForMid: mediaFiles.length ? userNode.id : null,
+          };
+          task.turn = turn;
+          await slot.wakeAndSend(turn);
+        } catch (e: any) {
+          this.tasks.delete(s.id);
+          const n = s.nodes[userNode.id];
+          if (n) n.error = humanError(e?.message ?? e);
+          this.persist("sessions");
+          this.broadcast("failed", { sid: s.id, msgId: userNode.id, detail: e?.message ?? String(e) });
+        }
+      })();
+
       return this.json({ ok: true, userMsgId: userNode.id });
     } catch (e: any) {
       return this.fail(e, 500);
@@ -714,7 +784,6 @@ export class Server {
       const uptoEntries = engineEntriesFrom(path, userMsgId); // up to AND including the user msg
       const uptoHash = hsh16(uptoEntries);
 
-      const slot = await this.app.ensureEngine(s);
       const g = mergeOverride(this.app.settings, s.override);
       const system = s.override?.systemPrompt ?? buildSystemPrompt({
         settings: this.app.settings,
@@ -739,22 +808,33 @@ export class Server {
         chunks: { think: "", text: "" },
       };
       this.tasks.set(s.id, task);
-
-      await slot.wakeAndSend({
-        sid: s.id,
-        uptoHash,
-        truncateAfterMid: userMsgId,
-        newMsgs: [],
-        system,
-        settings: { temperature: g.temperature, top_p: g.topP, max_tokens: g.maxOutputTokens },
-        search: { enabled: s.searchEnabled, max_queries: g.searchMaxQueries, pages_per_query: g.searchPagesPerQuery },
-        memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
-        memoryText: s.memoryEnabled ? this.app.memory.text : null,
-        thinking: s.thinkingEnabled,
-        skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
-      });
-
       this.broadcast("session", { sid: s.id, reason: "retry", userMsgId });
+
+      void (async () => {
+        try {
+          const slot = await this.app.ensureEngine(s);
+          task.slot = slot.username;
+          const turn = {
+            sid: s.id,
+            uptoHash,
+            truncateAfterMid: userMsgId,
+            newMsgs: [],
+            system,
+            settings: { temperature: g.temperature, top_p: g.topP, max_tokens: g.maxOutputTokens },
+            search: { enabled: s.searchEnabled, max_queries: g.searchMaxQueries, pages_per_query: g.searchPagesPerQuery },
+            memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
+            memoryText: s.memoryEnabled ? this.app.memory.text : null,
+            thinking: s.thinkingEnabled,
+            skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
+          };
+          task.turn = turn;
+          await slot.wakeAndSend(turn);
+        } catch (e: any) {
+          this.tasks.delete(s.id);
+          this.broadcast("failed", { sid: s.id, msgId: userMsgId, detail: e?.message ?? String(e) });
+        }
+      })();
+
       return this.json({ ok: true });
     } catch (e: any) {
       return this.fail(e, 500);
@@ -778,7 +858,6 @@ export class Server {
       const uptoEntries = engineEntriesBefore(activePath(s), old.id); // strictly before the old user msg
       const uptoHash = hsh16(uptoEntries);
 
-      const slot = await this.app.ensureEngine(s);
       const g = mergeOverride(this.app.settings, s.override);
       const system = s.override?.systemPrompt ?? buildSystemPrompt({
         settings: this.app.settings,
@@ -814,19 +893,33 @@ export class Server {
       };
       this.tasks.set(s.id, task);
 
-      await slot.wakeAndSend({
-        sid: s.id,
-        uptoHash,
-        truncateMid: old.id,
-        newMsgs: [{ role: "user", content: full, mid: node.id }],
-        system,
-        settings: { temperature: g.temperature, top_p: g.topP, max_tokens: g.maxOutputTokens },
-        search: { enabled: s.searchEnabled, max_queries: g.searchMaxQueries, pages_per_query: g.searchPagesPerQuery },
-        memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
-        memoryText: s.memoryEnabled ? this.app.memory.text : null,
-        thinking: s.thinkingEnabled,
-        skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
-      });
+      void (async () => {
+        try {
+          const slot = await this.app.ensureEngine(s);
+          task.slot = slot.username;
+          const turn = {
+            sid: s.id,
+            uptoHash,
+            truncateMid: old.id,
+            newMsgs: [{ role: "user", content: full, mid: node.id }],
+            system,
+            settings: { temperature: g.temperature, top_p: g.topP, max_tokens: g.maxOutputTokens },
+            search: { enabled: s.searchEnabled, max_queries: g.searchMaxQueries, pages_per_query: g.searchPagesPerQuery },
+            memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
+            memoryText: s.memoryEnabled ? this.app.memory.text : null,
+            thinking: s.thinkingEnabled,
+            skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
+          };
+          task.turn = turn;
+          await slot.wakeAndSend(turn);
+        } catch (e: any) {
+          this.tasks.delete(s.id);
+          const n = s.nodes[node.id];
+          if (n) n.error = humanError(e?.message ?? e);
+          this.persist("sessions");
+          this.broadcast("failed", { sid: s.id, msgId: node.id, detail: e?.message ?? String(e) });
+        }
+      })();
 
       this.persist("sessions");
       this.broadcast("session", { sid: s.id, reason: "edited", msgId: node.id });
@@ -836,9 +929,9 @@ export class Server {
     }
   }
 
-  private async switchDim(s: SessionData, msgId: string): Promise<Response> {
+  private async switchDim(s: SessionData, msgId: string, dir: 1 | -1 = 1): Promise<Response> {
     try {
-      if (!switchDimension(s, msgId)) return this.fail("no other version of this message");
+      if (!switchDimension(s, msgId, dir)) return this.fail("no other version of this message");
       this.persist("sessions");
       // Full path resync (rare structural change)
       const slot = this.app.slots.get(s.engineUsername ?? "");
@@ -973,6 +1066,7 @@ function mergeUser(current: any, patch: any) {
 
 function humanError(detail: any): string {
   const d = String(detail ?? "");
+  if (/429|rate.?limit|too many/i.test(d)) return "Kaggle is rate-limiting the relay for a moment. Give it a few seconds and send again — the engine itself is fine.";
   if (d.includes("exceed") || d.includes("context")) return "This reply went over the model's context window. Try a shorter message or clear the chat.";
   if (d.includes("CUDA") || d.includes("out of memory") || d.toLowerCase().includes("oom")) return "The GPUs ran out of memory. Restarting the engine usually fixes it.";
   if (d.includes("offline") || d.includes("internet")) return "The engine lost its internet connection. Try again in a moment.";

@@ -52,6 +52,11 @@ export interface ChatTurn {
   mediaForMid?: string | null; // which new message id carries the media
 }
 
+const DEBUG = !!process.env.SHUGGLE_DEBUG;
+function dbg(m: string): void {
+  if (DEBUG) console.error(`[engine ${new Date().toISOString().slice(11, 19)}] ${m}`);
+}
+
 export class EngineSlot {
   readonly username: string;
   private secret: string;
@@ -139,8 +144,18 @@ export class EngineSlot {
   /** Push (or re-push) the engine notebook and wait for it to be ready.
    *  force=true re-pushes even if a session is alive (the Restart button). */
   async boot(record: TokenRecord, force = false): Promise<void> {
+    if (this.bootPromise) return this.bootPromise;
+    this.bootPromise = this.bootInner(record, force).finally(() => {
+      this.bootPromise = null;
+    });
+    return this.bootPromise;
+  }
+
+  private async bootInner(record: TokenRecord, force = false): Promise<void> {
     this.lastError = null;
+    dbg(`boot: state=${this.state}`);
     const st = await this.kaggle.kernelStatus(this.username, this.slug);
+    dbg(`boot: kernel status ${st.status}`);
     if (st.status === "RUNNING" && !force) {
       // Already alive (e.g. app restarted) — adopt it.
       this.setState("waking", "Connecting to your engine");
@@ -160,6 +175,7 @@ export class EngineSlot {
       contextTokens: this.contextTokens,
       afkSeconds: this.afkSeconds,
     });
+    dbg("boot: pushing engine kernel");
     const res = await this.kaggle.pushKernel({
       owner: this.username,
       slug: this.slug,
@@ -174,7 +190,9 @@ export class EngineSlot {
     });
     this.slug = res.slug;
     this.resetRuntime();
+    dbg(`boot: pushed v${res.version}, attaching streams`);
     await this.attachStreams();
+    dbg("boot: complete");
   }
 
   private resetRuntime(): void {
@@ -297,14 +315,25 @@ export class EngineSlot {
     this.abortLog?.abort();
     this.abortLog = new AbortController();
     const signal = this.abortLog.signal;
-    let cursor = ""; // dedupe recent lines
     let reconnectDelay = 1000;
     while (!signal.aborted) {
       try {
         for await (const raw of this.kaggle.logStream(this.username, this.slug, signal)) {
           reconnectDelay = 1000;
           for (const line of raw.split("\n")) {
-            const m = line.match(/SHUGGLE (\{.*\})\s*$/);
+            // SSE envelope first: data: {"stream_name":"stdout","data":"SHUGGLE {...}\n"}
+            let payload = line;
+            if (payload.startsWith("data:")) payload = payload.slice(5).trim();
+            if (!payload) continue;
+            try {
+              const env = JSON.parse(payload);
+              if (env && typeof env === "object" && typeof env.data === "string") {
+                payload = env.data;
+              }
+            } catch {
+              /* not an envelope — treat as a plain stdout line */
+            }
+            const m = payload.match(/SHUGGLE (\{.*\})\s*$/);
             if (!m) continue;
             let j: any;
             try {
@@ -313,8 +342,9 @@ export class EngineSlot {
               continue;
             }
             const key = JSON.stringify(j);
-            if (key === cursor) continue;
-            cursor = key;
+            if (this.seenEvents.has(key)) continue;
+            this.seenEvents.add(key);
+            if (this.seenEvents.size > 1500) this.seenEvents = new Set([...this.seenEvents].slice(-800));
             this.handleEvent(j);
           }
         }
@@ -441,57 +471,104 @@ export class EngineSlot {
   }
 
   private nextV(): number {
-    return ++this.cmdV;
+    // Monotonic across restarts: the engine dedupes on `v` and remembers the
+    // last one it saw, so wall-clock milliseconds keep us always ahead.
+    this.cmdV = Math.max(this.cmdV + 1, Date.now());
+    return this.cmdV;
   }
 
-  /** Push a command into the engine's inbox. Media files ride in the same
-   *  dataset version as cmd.json — the engine fetches them by name. */
-  private async sendCmd(cmd: Record<string, any>, files: Record<string, string | Uint8Array> = {}): Promise<void> {
-    cmd.v = this.nextV();
-    cmd.profile = this.profile;
-    const payload: Record<string, string | Uint8Array> = { "cmd.json": JSON.stringify(cmd), ...files };
-    await this.kaggle.datasetUpsert(this.username, `shuggle-inbox-${this.ns}`, "Shuggle Inbox", payload, `v${cmd.v}`);
+  /** Push a command into the engine's inbox. Serialized per slot with
+   *  spacing, and insistent through Kaggle's rate limits. Media files ride
+   *  in the same dataset version as cmd.json — the engine fetches them by name. */
+  private sendQueue: Promise<void> = Promise.resolve();
+
+  private sendCmd(cmd: Record<string, any>, files: Record<string, string | Uint8Array> = {}): Promise<void> {
+    const run = async () => {
+      cmd.v = this.nextV();
+      cmd.profile = this.profile;
+      const payload: Record<string, string | Uint8Array> = { "cmd.json": JSON.stringify(cmd), ...files };
+      let lastErr: any = null;
+      for (let attempt = 0; attempt < 6; attempt++) {
+        try {
+          await this.kaggle.datasetUpsert(this.username, `shuggle-inbox-${this.ns}`, "Shuggle Inbox", payload, `v${cmd.v}`);
+          this.lastPushAt = Date.now();
+          return;
+        } catch (e: any) {
+          lastErr = e;
+          const msg = String(e?.message ?? e);
+          if (/429|rate|exceed|too many|403/i.test(msg)) {
+            dbg(`sendCmd: rate-limited (attempt ${attempt + 1}), backing off`);
+            await sleep(5000 * (attempt + 1));
+            continue;
+          }
+          throw e;
+        }
+      }
+      throw lastErr;
+    };
+    const spaced = this.sendQueue.then(async () => {
+      const gap = Date.now() - (this.lastPushAt ?? 0);
+      if (gap < 2500) await sleep(2500 - gap);
+    });
+    this.sendQueue = spaced.then(run).catch(() => {
+      // keep the queue alive even when a command ultimately fails
+    });
+    return spaced.then(() => this.sendQueue);
   }
+
+  private lastPushAt = 0;
 
   async wakeAndSend(turn: ChatTurn): Promise<void> {
-    if (this.state === "idle" || this.state === "sleeping" || this.state === "error") {
-      await this.boot({ id: this.username, secret: this.secret } as TokenRecord);
-    }
-    if (this.seenSessionHash[turn.sid] === undefined) {
-      // New session for this engine — create it there, then the delta applies.
-      await this.sendCmd({ type: "new_session", sid: turn.sid });
-      this.seenSessionHash[turn.sid] = "";
-    }
-    // Media files ride along in this inbox version.
-    const files: Record<string, string | Uint8Array> = {};
-    const mediaMeta: any[] = [];
-    for (const m of turn.media ?? []) {
-      if (m.bytes) {
-        files[m.file] = m.bytes;
-        mediaMeta.push({ name: m.name, kind: m.kind, file: m.file });
+    dbg(`wakeAndSend: state=${this.state} sid=${turn.sid.slice(0, 8)}`);
+    const run = async () => {
+      if (this.state === "idle" || this.state === "sleeping" || this.state === "error") {
+        await this.boot({ id: this.username, secret: this.secret } as TokenRecord);
       }
-    }
-    await this.sendCmd(
-      {
-        type: "chat",
-        sid: turn.sid,
-        msg_id: turn.newMsgs[turn.newMsgs.length - 1]?.mid,
-        upto_hash: turn.uptoHash,
-        truncate_mid: turn.truncateMid ?? null,
-        truncate_after_mid: turn.truncateAfterMid ?? null,
-        new_msgs: turn.newMsgs,
-        system: turn.system,
-        settings: turn.settings,
-        search: turn.search ?? { enabled: false, max_queries: 3, pages_per_query: 1 },
-        memory_hash: turn.memoryHash,
-        memory_text: turn.memoryText,
-        thinking: turn.thinking,
-        skills: turn.skills ?? [],
-        media: mediaMeta.length ? mediaMeta : undefined,
-      },
-      files,
-    );
+      dbg("wakeAndSend: booted, pushing session cmd");
+      if (this.seenSessionHash[turn.sid] === undefined) {
+        // New session for this engine — create it there, then the delta applies.
+        await this.sendCmd({ type: "new_session", sid: turn.sid });
+        this.seenSessionHash[turn.sid] = "";
+      }
+      // Media files ride along in this inbox version.
+      const files: Record<string, string | Uint8Array> = {};
+      const mediaMeta: any[] = [];
+      for (const m of turn.media ?? []) {
+        if (m.bytes) {
+          files[m.file] = m.bytes;
+          mediaMeta.push({ name: m.name, kind: m.kind, file: m.file });
+        }
+      }
+      await this.sendCmd(
+        {
+          type: "chat",
+          sid: turn.sid,
+          msg_id: turn.newMsgs[turn.newMsgs.length - 1]?.mid,
+          upto_hash: turn.uptoHash,
+          truncate_mid: turn.truncateMid ?? null,
+          truncate_after_mid: turn.truncateAfterMid ?? null,
+          new_msgs: turn.newMsgs,
+          system: turn.system,
+          settings: turn.settings,
+          search: turn.search ?? { enabled: false, max_queries: 3, pages_per_query: 1 },
+          memory_hash: turn.memoryHash,
+          memory_text: turn.memoryText,
+          thinking: turn.thinking,
+          skills: turn.skills ?? [],
+          media: mediaMeta.length ? mediaMeta : undefined,
+        },
+        files,
+      );
+      dbg("wakeAndSend: chat cmd pushed");
+    };
+    // Serialize wakes per slot — resync continuations and fresh sends must
+    // never interleave boots or double-send the same turn.
+    this.wakeQueue = this.wakeQueue.then(run, run);
+    return this.wakeQueue;
   }
+
+  private wakeQueue: Promise<void> = Promise.resolve();
+  private seenEvents = new Set<string>(); // survives log-loop restarts
 
   async resyncPath(sid: string, history: { role: string; content: string; mid?: string }[]): Promise<void> {
     await this.sendCmd({ type: "edit_path", sid, history });
@@ -613,6 +690,7 @@ for FILENAME, GB in FILES:
     j = rpc("blobs.BlobApiService/StartBlobUpload", {"type": "DATASET", "name": FILENAME,
         "contentType": "application/octet-stream", "contentLength": size,
         "lastModifiedEpochSeconds": int(time.time())})
+    create_url = j["createUrl"]
     slog("Uploading " + FILENAME + " to your Kaggle storage (" + str(GB) + " GB)")
     t0 = time.time()
     sent = 0
@@ -620,18 +698,24 @@ for FILENAME, GB in FILES:
         while sent < size:
             chunk = f.read(CHUNK)
             end = sent + len(chunk) - 1
-            headers = {"Content-Length": str(len(chunk)), "Content-Type": "application/octet-stream"}
-            if sent > 0 or len(chunk) < size:
-                headers["Content-Range"] = "bytes " + str(sent) + "-" + str(end) + "/" + str(size)
-            req = urllib.request.Request(j["createUrl"], data=chunk, headers=headers, method="PUT")
+            headers = {"Content-Length": str(len(chunk)), "Content-Type": "application/octet-stream",
+                       "Content-Range": "bytes " + str(sent) + "-" + str(end) + "/" + str(size)}
+            req = urllib.request.Request(create_url, data=chunk, headers=headers, method="PUT")
+            code = 0
             try:
                 with urllib.request.urlopen(req, timeout=900) as r:
-                    pass
+                    code = r.status
             except urllib.error.HTTPError as e:
-                if e.code not in (200, 201):
+                code = e.code
+                if code == 308:
+                    pass  # Resume Incomplete = chunk accepted, keep going
+                elif code >= 500:
                     f.seek(sent)
                     time.sleep(3)
                     continue
+                else:
+                    slog("Upload failed with HTTP " + str(code))
+                    raise
             sent += len(chunk)
             if sent % (CHUNK * 16) == 0 or sent >= size:
                 rate = sent / max(1e-9, time.time() - t0) / 1e6
