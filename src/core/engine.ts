@@ -76,6 +76,8 @@ export class EngineSlot {
   private visionState: VisionState = "unknown";
   private visionDetail: string | null = null;
   private bootGraceUntil = 0;
+  private lastSseAt = 0;
+  private recovering = false;
 
   constructor(opts: { username: string; secret: string; profile: string; contextTokens: number; afkSeconds: number; events: EventEmitter }) {
     this.username = opts.username;
@@ -143,12 +145,46 @@ export class EngineSlot {
     this.lastError = null;
     const st = await this.kaggle.kernelStatus(this.username, this.slug);
     if (st.status === "RUNNING" && !force) {
-      // Already alive (e.g. app restarted) — adopt it.
-      this.setState("waking", "Connecting to your engine");
-      await this.attachStreams();
-      return;
+      // A session claims to be alive. Verify it actually produces output —
+      // Kaggle occasionally leaves zombie sessions (RUNNING with no logs)
+      // that would silently queue every new push behind them for hours.
+      const alive = await this.sessionProducesOutput(12_000);
+      if (alive) {
+        this.setState("waking", "Connecting to your engine");
+        this.lastSseAt = Date.now();
+        await this.attachStreams();
+        return;
+      }
+      this.setState("booting", "Clearing a stuck engine session");
+      await this.kaggle.deleteKernel(this.username, this.slug).catch(() => {});
+      await sleep(4_000);
     }
-    this.setState("booting", force ? "Restarting your engine" : "Starting your engine");
+    await this.pushAndAttach(record, force ? "Restarting your engine" : "Starting your engine");
+  }
+
+  /** True if the kernel's live log yields any line within `windowMs`. */
+  private async sessionProducesOutput(windowMs: number): Promise<boolean> {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), windowMs);
+      try {
+        for await (const raw of this.kaggle.logStream(this.username, this.slug, ctrl.signal)) {
+          if (raw.trim()) {
+            clearTimeout(timer);
+            return true;
+          }
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch {
+      /* aborted / unavailable */
+    }
+    return false;
+  }
+
+  private async pushAndAttach(record: TokenRecord, bootLabel: string): Promise<void> {
+    this.setState("booting", bootLabel);
     this.bootStartedAt = Date.now();
     await this.ensureDatasets();
     if (!(await this.modelDatasetReady())) {
@@ -179,6 +215,7 @@ export class EngineSlot {
     // COMPLETE/ERROR while the new one is QUEUED). Grace period stops the
     // relay from shutting down during that window.
     this.bootGraceUntil = Date.now() + 150_000;
+    this.lastSseAt = Date.now();
     await this.attachStreams();
   }
 
@@ -255,8 +292,9 @@ export class EngineSlot {
   /** Start the log-stream reader + outbox poller + status watcher. */
   private async attachStreams(): Promise<void> {
     this.stopTimers();
-    // status watcher: detects external death (timeout, manual stop)
+    // status watcher: detects external death + zombie sessions
     this.statusTimer = setInterval(async () => {
+      if (this.recovering) return;
       if (this.state === "generating" || this.state === "ready" || this.state === "waking" || this.state === "booting") {
         try {
           const st = await this.kaggle.kernelStatus(this.username, this.slug);
@@ -265,12 +303,23 @@ export class EngineSlot {
             this.setState(st.status === "ERROR" ? "error" : "sleeping", st.status === "ERROR" ? "The engine hit a problem" : "Your engine is resting");
             if (st.status === "ERROR") this.lastError = st.failureMessage ?? "engine error";
             this.stopTimers();
+            return;
+          }
+          // Zombie watch: RUNNING but the log stream went silent for a long time.
+          if (st.status === "RUNNING" && this.lastSseAt > 0 && Date.now() - this.lastSseAt > 8 * 60_000 && this.state !== "generating") {
+            this.recovering = true;
+            this.setState("booting", "Clearing a stuck engine session");
+            this.stopTimers();
+            await this.kaggle.deleteKernel(this.username, this.slug).catch(() => {});
+            await sleep(4_000);
+            this.recovering = false;
+            void this.pushAndAttach({ id: this.username, secret: this.secret } as TokenRecord, "Starting your engine");
           }
         } catch {
           /* transient */
         }
       }
-    }, 20_000);
+    }, 30_000);
 
     // outbox poller: durable fallback + boot completion signal
     let lastOutbox = "";
@@ -281,11 +330,12 @@ export class EngineSlot {
         if (!text || text === lastOutbox) return;
         lastOutbox = text;
         const j = JSON.parse(text);
-        if (j.ev === "done" && j.sid) {
+        if ((j.ev === "done" && j.sid) || (j.ev === "sleeping" && j.last_done?.sid)) {
           // authoritative turn completion (log stream may have been missed)
           this.lastDone = j;
           this.emit("outbox-done", j);
-          this.generating.delete(j.sid);
+          if (j.sid) this.generating.delete(j.sid);
+          if (j.last_done?.sid) this.generating.delete(j.last_done.sid);
         } else if (j.ev === "sleeping") {
           this.setState("sleeping", "Your engine is resting");
         }
@@ -321,6 +371,7 @@ export class EngineSlot {
             const key = JSON.stringify(j);
             if (key === cursor) continue;
             cursor = key;
+            this.lastSseAt = Date.now();
             this.handleEvent(j);
           }
         }
@@ -432,10 +483,22 @@ export class EngineSlot {
       case "search":
         this.emit("search", { sid: j.sid, phase: j.phase, data: j.data ?? null });
         break;
-      case "sleeping":
-        this.setState("sleeping", "Your engine is resting");
-        this.stopTimers();
+      case "sleeping": {
+        // The log replays past sessions — confirm with the live status before
+        // believing an afk-stop.
+        void (async () => {
+          try {
+            const st = await this.kaggle.kernelStatus(this.username, this.slug);
+            if (st.status !== "RUNNING" && st.status !== "QUEUED") {
+              this.setState("sleeping", "Your engine is resting");
+              this.stopTimers();
+            }
+          } catch {
+            /* keep current state */
+          }
+        })();
         break;
+      }
       case "hb":
         break;
       case "cmd":

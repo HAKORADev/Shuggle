@@ -142,27 +142,32 @@ export class Server {
         // tracking this sid anymore — adopt the finished reply directly.
         const j = ev;
         this.app.lastOutboxBySid.set(j.sid, j);
-        if (!this.tasks.has(j.sid)) {
-          const s = this.app.sessions.sessions[j.sid];
-          if (s && j.content) {
+        const done = j.content ? j : (j.last_done ?? null);
+        if (done?.content) this.app.lastOutboxBySid.set(done.sid, done);
+        const target = j.content ? j : j.last_done;
+        if (!this.tasks.has(j.sid) && target?.content) {
+          const s = this.app.sessions.sessions[target.sid];
+          if (s) {
             const path = activePath(s);
             const last = path.length ? path[path.length - 1] : null;
-            if (last && last.role === "assistant" && !last.content) {
-              last.content = j.content;
-              last.thinking = j.thinking ?? null;
-              last.genMs = j.gen_ms ?? null;
+            const fill = (nodeId: string | null) => {
               this.persist("sessions");
-              this.broadcast("done", { sid: j.sid, msgId: last.id, genMs: j.gen_ms ?? null, adopted: true });
+              this.broadcast("done", { sid: target.sid, msgId: nodeId, genMs: target.gen_ms ?? null, adopted: true });
+            };
+            if (last && last.role === "assistant" && !last.content) {
+              last.content = target.content;
+              last.thinking = target.thinking ?? null;
+              last.genMs = target.gen_ms ?? null;
+              fill(last.id);
             } else if (!last || last.role === "user") {
-              const node = addNode(s, j.msg_id ?? (last?.id ?? null), {
+              const node = addNode(s, target.msg_id ?? (last?.id ?? null), {
                 role: "assistant",
-                content: j.content,
-                thinking: j.thinking ?? null,
-                genMs: j.gen_ms ?? null,
+                content: target.content,
+                thinking: target.thinking ?? null,
+                genMs: target.gen_ms ?? null,
                 attachments: [],
               });
-              this.persist("sessions");
-              this.broadcast("done", { sid: j.sid, msgId: node.id, genMs: j.gen_ms ?? null, adopted: true });
+              fill(node.id);
             }
           }
         }

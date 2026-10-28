@@ -272,6 +272,7 @@ llm = None
 VISION = {"handler": None, "mmproj": None, "name": None, "failed": None}
 CHARS_PER_TOKEN = 3.2
 IMAGE_TOKEN_EST = 600   # 768px ViT, patch16, 2x2 merge -> ~576 embeddings + overhead
+LAST_DONE = None        # last finished reply — the sleeping outbox carries it
 
 def ensure_deps():
     global llm
@@ -1103,6 +1104,9 @@ def handle_chat(cmd):
                  "search_brief": result["search_brief"],
                  "search_queries": result["search_queries"],
                  "mem_results": mem_results})
+    global LAST_DONE
+    LAST_DONE = {"sid": sid, "v": cmd.get("v", 0), "gen_ms": result["gen_ms"], "content": result["content"],
+                 "thinking": result["thinking"], "mem_results": mem_results}
     save_store()
 
 def handle_edit_path(cmd):
@@ -1129,7 +1133,7 @@ def handle_config(cmd):
     slog({"ev": "config", "patch": {k: CFG.get(k) for k in ("afkSeconds", "visionEnabled", "visionMaxFrames", "visionFrameSeconds", "mediaBudget")}})
 
 def dispatch(cmd):
-    global SEEN_V, LAST_CMD
+    global SEEN_V, LAST_CMD, LAST_DONE
     if cmd.get("profile") and cmd["profile"] != PROFILE:
         slog({"ev": "err", "where": "profile", "d": "command is for another profile"})
         return
@@ -1142,7 +1146,7 @@ def dispatch(cmd):
     if t == "sleep":
         save_store()
         slog({"ev": "sleeping", "reason": "request"})
-        outbox_push({"ev": "sleeping", "v": cmd.get("v", 0)})
+        outbox_push({"ev": "sleeping", "v": cmd.get("v", 0), "last_done": LAST_DONE})
         time.sleep(1)
         sys.exit(0)
     if t == "config":
@@ -1182,7 +1186,7 @@ def main():
         if time.time() - LAST_CMD > int(CFG.get("afkSeconds", 180)):
             save_store()
             slog({"ev": "sleeping", "reason": "afk"})
-            outbox_push({"ev": "sleeping", "reason": "afk"})
+            outbox_push({"ev": "sleeping", "reason": "afk", "last_done": LAST_DONE})
             time.sleep(1)
             sys.exit(0)
         time.sleep(2)
