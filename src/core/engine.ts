@@ -377,9 +377,16 @@ export class EngineSlot {
     let cursor = ""; // dedupe recent lines
     let reconnectDelay = 1000;
     while (!signal.aborted) {
+      // Events within the first 20s of a connection are history replays
+      // (the stream re-serves the whole session log on every connect).
+      // They carry DATA (chunks, done, memory) but must not drive the
+      // lifecycle state — a replayed "sleeping" from the previous session
+      // would otherwise kill the relay for a session that is still queued.
+      const connAt = Date.now();
       try {
         for await (const raw of this.kaggle.logStream(this.username, this.slug, signal)) {
           reconnectDelay = 1000;
+          const live = Date.now() - connAt > 20_000;
           for (const line of raw.split("\n")) {
             const m = line.match(/SHUGGLE (\{.*\})\s*$/);
             if (!m) continue;
@@ -393,7 +400,7 @@ export class EngineSlot {
             if (key === cursor) continue;
             cursor = key;
             this.lastSseAt = Date.now();
-            this.handleEvent(j);
+            this.handleEvent(j, live);
           }
         }
       } catch {
@@ -421,16 +428,16 @@ export class EngineSlot {
     }
   }
 
-  private handleEvent(j: any): void {
+  private handleEvent(j: any, live: boolean): void {
     switch (j.ev) {
       case "meta":
         if (j.phase === "ready") {
-          this.awaitingFreshBoot = false;
+          if (live) this.awaitingFreshBoot = false;
           this.setState("ready");
         } else if (["booting", "installing-deps", "finding-model", "model-copy", "model-copied", "model-local", "loading-model", "model-from-dataset", "model-download-fallback", "store-loaded", "model-ready"].includes(j.phase)) {
-          // A booting event arriving long after the push is the NEW session's
-          // — replays land within seconds of connecting.
-          if (Date.now() - this.pushedAt > 60_000) this.awaitingFreshBoot = false;
+          // Only LIVE booting events prove the new session started — replays
+          // of the previous session's boot arrive on every reconnect.
+          if (live) this.awaitingFreshBoot = false;
           if (this.state !== "generating") this.setState("booting", humanBootPhase(j.phase, j.detail));
         }
         break;
@@ -509,7 +516,7 @@ export class EngineSlot {
         this.emit("search", { sid: j.sid, phase: j.phase, data: j.data ?? null });
         break;
       case "sleeping": {
-        if (this.awaitingFreshBoot) break; // replay from the previous session
+        if (!live || this.awaitingFreshBoot) break; // replay from a previous session
         // The log replays past sessions — confirm with the live status before
         // believing an afk-stop.
         void (async () => {
