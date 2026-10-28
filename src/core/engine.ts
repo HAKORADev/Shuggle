@@ -75,6 +75,7 @@ export class EngineSlot {
   private generating = new Set<string>(); // sids with in-flight generation
   private visionState: VisionState = "unknown";
   private visionDetail: string | null = null;
+  private bootGraceUntil = 0;
 
   constructor(opts: { username: string; secret: string; profile: string; contextTokens: number; afkSeconds: number; events: EventEmitter }) {
     this.username = opts.username;
@@ -174,6 +175,10 @@ export class EngineSlot {
     });
     this.slug = res.slug;
     this.resetRuntime();
+    // The status API can lag the push (it still reports the previous session's
+    // COMPLETE/ERROR while the new one is QUEUED). Grace period stops the
+    // relay from shutting down during that window.
+    this.bootGraceUntil = Date.now() + 150_000;
     await this.attachStreams();
   }
 
@@ -256,6 +261,7 @@ export class EngineSlot {
         try {
           const st = await this.kaggle.kernelStatus(this.username, this.slug);
           if (st.status === "COMPLETE" || st.status === "ERROR" || st.status === "CANCEL_ACKNOWLEDGED") {
+            if (Date.now() < this.bootGraceUntil) return; // push lag — the new session is on its way
             this.setState(st.status === "ERROR" ? "error" : "sleeping", st.status === "ERROR" ? "The engine hit a problem" : "Your engine is resting");
             if (st.status === "ERROR") this.lastError = st.failureMessage ?? "engine error";
             this.stopTimers();
@@ -322,10 +328,11 @@ export class EngineSlot {
         /* drop */
       }
       if (signal.aborted) return;
-      // Stream ended — reconnect unless the engine is gone.
+      // Stream ended — reconnect unless the engine is truly gone.
       try {
         const st = await this.kaggle.kernelStatus(this.username, this.slug);
-        if (st.status !== "RUNNING") {
+        const alive = st.status === "RUNNING" || st.status === "QUEUED" || st.status === "INITIALIZING";
+        if (!alive && Date.now() >= this.bootGraceUntil) {
           if (st.status === "COMPLETE") this.setState("sleeping", "Your engine is resting");
           if (st.status === "ERROR") {
             this.setState("error", "The engine hit a problem");
@@ -618,22 +625,34 @@ for FILENAME, GB in FILES:
     sent = 0
     with open(path, "rb") as f:
         while sent < size:
+            f.seek(sent)
             chunk = f.read(CHUNK)
-            end = sent + len(chunk) - 1
             headers = {"Content-Length": str(len(chunk)), "Content-Type": "application/octet-stream"}
-            if sent > 0 or len(chunk) < size:
-                headers["Content-Range"] = "bytes " + str(sent) + "-" + str(end) + "/" + str(size)
+            headers["Content-Range"] = "bytes " + str(sent) + "-" + str(sent + len(chunk) - 1) + "/" + str(size)
             req = urllib.request.Request(j["createUrl"], data=chunk, headers=headers, method="PUT")
             try:
                 with urllib.request.urlopen(req, timeout=900) as r:
-                    pass
+                    code = r.status
+                    rng = r.headers.get("Range", "")
             except urllib.error.HTTPError as e:
-                if e.code not in (200, 201):
-                    f.seek(sent)
+                code = e.code
+                rng = e.headers.get("Range", "") if e.headers else ""
+                if code not in (200, 201, 308):
                     time.sleep(3)
                     continue
-            sent += len(chunk)
-            if sent % (CHUNK * 16) == 0 or sent >= size:
+            if code in (200, 201):
+                sent = size
+                break
+            # 308 Resume Incomplete — the server reports how much it already has
+            if rng.startswith("bytes=0-"):
+                have = int(rng.split("-")[1]) + 1
+                if have <= sent:
+                    time.sleep(3)
+                    continue
+                sent = have
+            else:
+                sent += len(chunk)
+            if sent % (CHUNK * 16) < CHUNK or sent >= size:
                 rate = sent / max(1e-9, time.time() - t0) / 1e6
                 slog("Uploaded " + str(round(sent / 1e9, 2)) + " / " + str(round(size / 1e9, 2)) + " GB (" + str(int(rate)) + " MB/s)")
     tokens.append({"token": j["token"], "description": FILENAME, "columns": []})

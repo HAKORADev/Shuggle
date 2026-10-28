@@ -18,6 +18,7 @@ interface ChatTask {
   text: string;
   startedAt: number;
   chunks: { think: string; text: string };
+  slot: string; // engine username this turn was sent to
 }
 
 interface IncomingMedia {
@@ -56,9 +57,26 @@ export class Server {
   private onEngineEvent(ev: any): void {
     const slot = ev.slot;
     switch (ev.type) {
-      case "state":
+      case "state": {
         this.broadcast("engine", { slot, state: ev.state, detail: ev.detail });
+        // If the engine died while tasks were pending, fail them honestly.
+        if (ev.state === "error" || ev.state === "sleeping") {
+          for (const [sid, task] of [...this.tasks.entries()]) {
+            if (task.slot !== slot) continue;
+            this.tasks.delete(sid);
+            const s = this.app.sessions.sessions[sid];
+            if (s && task.assistantMsgId && s.nodes[task.assistantMsgId]) {
+              s.nodes[task.assistantMsgId].error =
+                ev.state === "error"
+                  ? "The engine hit a problem while replying. Try again — it restarts on its own."
+                  : "The engine rested before finishing this reply. Send again to wake it.";
+            }
+            this.persist("sessions");
+            this.broadcast("failed", { sid, msgId: task.assistantMsgId, detail: "engine " + ev.state });
+          }
+        }
         break;
+      }
       case "chunk": {
         const task = this.taskFor(ev.sid);
         if (!task) break;
@@ -678,6 +696,7 @@ export class Server {
         text,
         startedAt: Date.now(),
         chunks: { think: "", text: "" },
+        slot: slot.username,
       };
       this.tasks.set(s.id, task);
 
@@ -737,6 +756,7 @@ export class Server {
         text: userNode.content,
         startedAt: Date.now(),
         chunks: { think: "", text: "" },
+        slot: slot.username,
       };
       this.tasks.set(s.id, task);
 
@@ -811,6 +831,7 @@ export class Server {
         text,
         startedAt: Date.now(),
         chunks: { think: "", text: "" },
+        slot: slot.username,
       };
       this.tasks.set(s.id, task);
 
