@@ -195,7 +195,7 @@ def load_store():
     except Exception as e:
         err("store-load", e)
 
-def save_store():
+def save_store(retries=2):
     try:
         content = json.dumps(STORE, ensure_ascii=False).encode()
         j = rpc("blobs.BlobApiService/StartBlobUpload", {
@@ -213,6 +213,12 @@ def save_store():
                      "description": "Shuggle engine storage (sessions, memory). Managed automatically.",
                      "categoryIds": [], "versionNotes": "t" + str(int(time.time()))}}, 300)
         slog({"ev": "store-saved"})
+    except urllib.error.HTTPError as e:
+        if e.code == 429 and retries > 0:
+            time.sleep(45)
+            save_store(retries - 1)
+        else:
+            err("store-save", e)
     except Exception as e:
         err("store-save", e)
 

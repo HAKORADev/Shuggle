@@ -78,6 +78,7 @@ export class EngineSlot {
   private bootGraceUntil = 0;
   private lastSseAt = 0;
   private recovering = false;
+  private lastCmdSentAt = 0;
 
   constructor(opts: { username: string; secret: string; profile: string; contextTokens: number; afkSeconds: number; events: EventEmitter }) {
     this.username = opts.username;
@@ -531,6 +532,7 @@ export class EngineSlot {
     cmd.v = this.nextV();
     cmd.profile = this.profile;
     const payload: Record<string, string | Uint8Array> = { "cmd.json": JSON.stringify(cmd), ...files };
+    this.lastCmdSentAt = Date.now();
     await this.kaggle.datasetUpsert(this.username, `shuggle-inbox-${this.ns}`, "Shuggle Inbox", payload, `v${cmd.v}`);
   }
 
@@ -595,12 +597,15 @@ export class EngineSlot {
   }
 
   async ping(): Promise<void> {
-    if (this.state === "ready" || this.state === "generating" || this.state === "booting") {
-      try {
-        await this.sendCmd({ type: "stay" });
-      } catch {
-        /* ping loss is fine */
-      }
+    // Pings ride the same snapshot-semantics inbox as chat commands — a ping
+    // must never overwrite a freshly queued chat. Only ping a proven-idle
+    // engine, and never within 20s of sending a real command.
+    if (this.state !== "ready" && this.state !== "generating") return;
+    if (Date.now() - this.lastCmdSentAt < 20_000) return;
+    try {
+      await this.sendCmd({ type: "stay" });
+    } catch {
+      /* ping loss is fine */
     }
   }
 
