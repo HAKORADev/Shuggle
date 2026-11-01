@@ -536,7 +536,16 @@ export class EngineSlot {
               /* not an envelope — treat as a plain stdout line */
             }
             const m = payload.match(/SHUGGLE (\{.*\})\s*$/);
-            if (!m) continue;
+            if (!m) {
+              // Not one of our events — but llama.cpp prints the model load
+              // progress (layers offloaded to the GPUs). Surface it, so a slow
+              // load does not look like a hang.
+              const t = payload.trim();
+              if (t && /llama_|load_tensors|offload|model size|n_ctx|graph|n_layer/i.test(t) && t.length < 400) {
+                this.emit("engine-log", { where: "load", detail: t });
+              }
+              continue;
+            }
             let j: any;
             try {
               j = JSON.parse(m[1]);

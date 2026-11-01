@@ -439,15 +439,22 @@ def boot_model():
             err("hf-download", e)
             path = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE, local_dir="/kaggle/tmp/model",
                                    force_download=True)
-    slog({"ev": "meta", "phase": "loading-model"})
+    try:
+        size_gb = round(os.path.getsize(path) / 1e9, 2)
+        slog({"ev": "meta", "phase": "loading-model", "detail": str(size_gb) + " GB"})
+    except Exception:
+        slog({"ev": "meta", "phase": "loading-model"})
     from llama_cpp import Llama
     t0 = time.time()
+    # verbose=True: llama.cpp prints the load progress (layers offloaded to
+    # the GPUs, bytes read). Loading 17 GB straight off the Kaggle mount can
+    # take a while on a slow FUSE mount, and silence looks like a hang.
     llm = Llama(
         model_path=path,
         n_gpu_layers=-1,
         n_ctx=int(CFG.get("contextTokens", 75000)),
         n_batch=512,
-        verbose=False,
+        verbose=True,
     )
     slog({"ev": "meta", "phase": "model-ready", "detail": round(time.time() - t0, 1)})
     try:

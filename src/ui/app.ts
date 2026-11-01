@@ -24,6 +24,7 @@ const app = {
   sectionCollapse: { pinned: false, history: false } as Record<string, boolean>,
   sending: false,
   visionToastShown: false,
+  engineLog: {} as Record<string, string>,
 };
 
 // ------------------------------------------------------------------ utils
@@ -186,6 +187,8 @@ function renderEngineStates(): void {
   const st = engineStateFor(meta?.engineUsername ?? null);
   const chip = $("#engine-chip");
   chip.className = `engine-chip ${st}`;
+  const log = meta?.engineUsername ? app.engineLog[meta.engineUsername] : "";
+  if (log) chip.title = log;
   const label: Record<string, string> = {
     idle: "idle", booting: "waking", seeding: "setting up", waking: "connecting",
     ready: "ready", generating: "writing", sleeping: "resting", error: "trouble",
@@ -728,6 +731,14 @@ function connectStream(): void {
       return;
     }
     switch (data.type) {
+      case "engine-log":
+        // The engine narrates what it is doing (loading the model, offloading
+        // layers…). Keep the last line so the window can show it.
+        if (data.slot) {
+          app.engineLog[data.slot] = String(data.detail ?? "");
+          renderEngineStates();
+        }
+        break;
       case "engine":
         if (app.currentMeta) {
           const idx = app.engines.findIndex((e) => e.username === data.slot);
