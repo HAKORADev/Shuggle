@@ -41,6 +41,7 @@ export interface ChatTurn {
   truncateMid?: string | null; // truncate engine history BEFORE this mid (edits)
   truncateAfterMid?: string | null; // truncate engine history AFTER this mid (retries)
   newMsgs: { role: string; content: string; mid?: string }[];
+  fullPath?: { role: string; content: string; mid?: string }[]; // authoritative history projection — lets the engine self-heal divergences without a round-trip
   system: string;
   settings: { temperature: number; top_p: number; max_tokens: number };
   search?: { enabled: boolean; max_queries: number; pages_per_query: number };
@@ -57,7 +58,7 @@ export class EngineSlot {
   private secret: string;
   private kaggle: Kaggle;
   private events: EventEmitter;
-  private cmdV = 0;
+  private cmdV = Date.now(); // epoch-seeded: always outranks any legacy inbox versions left from older engine eras (a stale timestamp-v command would otherwise poison SEEN_V and every new command would be "older")
   private state: SlotState = "idle";
   private abortLog: AbortController | null = null;
   private outboxTimer: NodeJS.Timeout | null = null;
@@ -260,6 +261,24 @@ export class EngineSlot {
           try {
             const st = await this.kaggle.kernelStatus(this.username, this.slug);
             if (st.status === "ERROR" || st.status === "COMPLETE") {
+              if (st.status === "COMPLETE") {
+                // COMPLETE during a boot can mean two very different things:
+                // the engine ran and already rested (a good boot the stream
+                // never reported), or it died before becoming usable. The
+                // outbox tells them apart — afk-sleep always carries last_done.
+                try {
+                  const raw = await this.kaggle.datasetDownloadText(this.username, `shuggle-outbox-${this.ns}`, "state.json");
+                  const ob = raw ? JSON.parse(raw) : null;
+                  if (ob?.ev === "sleeping" && ob?.last_done?.sid) {
+                    this.awaitingFreshBoot = false;
+                    this.setState("sleeping", "Your engine is resting");
+                    this.stopTimers();
+                    return;
+                  }
+                } catch {
+                  /* fall through to the honest failure below */
+                }
+              }
               this.awaitingFreshBoot = false;
               this.lastError = st.failureMessage ?? "the engine stopped while starting";
               this.setState("error", "The engine could not finish starting — it will try again on your next message");
@@ -390,7 +409,27 @@ export class EngineSlot {
         const text = await this.kaggle.datasetDownloadText(this.username, `shuggle-outbox-${this.ns}`, "state.json");
         if (!text || text === lastOutbox) return;
         lastOutbox = text;
+        // Outbox payloads prove the engine is alive just as well as log
+        // lines do — the zombie watch must not kill a healthy session just
+        // because the SSE stream is rate-limited.
+        this.lastSseAt = Date.now();
         const j = JSON.parse(text);
+        if (j.ev === "ready" && (this.state === "booting" || this.state === "seeding")) {
+          // Durable boot-complete signal (rate-limit-proof — the log stream
+          // can be down for minutes, the outbox always lands).
+          this.awaitingFreshBoot = false;
+          this.setState("ready");
+          if (j.mem?.hash && j.mem.hash !== this.memHash) {
+            this.memHash = j.mem.hash;
+            this.emit("mem", { hash: j.mem.hash, text: j.mem.text ?? null });
+          }
+          return;
+        }
+        if (j.mem?.hash && j.mem.hash !== this.memHash) {
+          // engine-side memory edits (memory tools) — durable sync
+          this.memHash = j.mem.hash;
+          this.emit("mem", { hash: j.mem.hash, text: j.mem.text ?? null });
+        }
         if ((j.ev === "done" && j.sid) || (j.ev === "sleeping" && j.last_done?.sid)) {
           // authoritative turn completion (log stream may have been missed)
           this.lastDone = j;
@@ -619,6 +658,7 @@ export class EngineSlot {
     cmd.profile = this.profile;
     const payload: Record<string, string | Uint8Array> = { "cmd.json": JSON.stringify(cmd), ...files };
     this.lastCmdSentAt = Date.now();
+    console.log(`[engine ${this.username}] cmd v=${cmd.v} type=${cmd.type}${cmd.sid ? " sid=" + String(cmd.sid).slice(0, 8) : ""}`);
     await this.kaggle.datasetUpsert(this.username, `shuggle-inbox-${this.ns}`, "Shuggle Inbox", payload, `v${cmd.v}`);
     return cmd.v;
   }
@@ -660,6 +700,7 @@ export class EngineSlot {
         upto_hash: turn.uptoHash,
         truncate_mid: turn.truncateMid ?? null,
         truncate_after_mid: turn.truncateAfterMid ?? null,
+        full_path: turn.fullPath ?? undefined,
         new_msgs: turn.newMsgs,
         system: turn.system,
         settings: turn.settings,

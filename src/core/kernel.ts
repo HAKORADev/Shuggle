@@ -757,10 +757,21 @@ def do_search(messages, search_cfg, settings):
         return None, queries, messages
     slog({"ev": "search", "phase": "brief", "data": brief[:120], "v": LAST_CMD_V})
     new_messages = list(messages)
-    new_messages.insert(len(new_messages) - 1, {
-        "role": "system",
-        "content": "Fresh web research brief for the user's request (sources in parentheses):\n" + brief,
-    })
+    # The brief rides INSIDE the final user message — newer Qwen templates
+    # forbid system messages anywhere but the very beginning of the list.
+    brief_text = "[Fresh web research brief for this request — facts with their source titles in parentheses. Use what helps, ignore the rest:]\n" + brief + "\n[/web research brief]\n\n"
+    last = new_messages[-1] if new_messages else None
+    if last and last.get("role") == "user":
+        c = last.get("content")
+        if isinstance(c, list):  # multimodal — prepend to the first text part
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    part["text"] = brief_text + part.get("text", "")
+                    break
+        else:
+            last["content"] = brief_text + str(c or "")
+    else:
+        new_messages.append({"role": "user", "content": brief_text + "Answer the user's latest message with this research in mind."})
     return brief, queries, new_messages
 
 # ------------------------------------------------------- memory ops (v3) ----
@@ -978,6 +989,17 @@ def handle_chat(cmd):
     upto = cmd.get("upto_hash", "")
     cur_hash = hsh(history_projection(hist))
     if cur_hash != upto:
+        # Self-heal: the command carries the app's authoritative history —
+        # adopt it when it hashes to exactly what the app expects. This works
+        # with NO round-trip, even if the resync event never reaches the app.
+        fp = cmd.get("full_path")
+        if isinstance(fp, list):
+            fp_norm = [{"role": m["role"], "content": m["content"], **({"mid": m["mid"]} if m.get("mid") else {})} for m in fp]
+            if hsh(history_projection(fp_norm)) == upto:
+                hist = fp_norm
+                cur_hash = upto
+                slog({"ev": "cmd", "v": cmd.get("v", 0), "type": "self-heal", "msgs": len(hist)})
+    if cur_hash != upto:
         tm = cmd.get("truncate_mid")
         if tm:
             idx = next((i for i, m in enumerate(hist) if m.get("mid") == tm), -1)
@@ -1031,7 +1053,10 @@ def handle_chat(cmd):
             mem_state()["text"] = cmd["memory_text"]
             mem_state()["hash"] = cmd["memory_hash"]
 
-    msgs = [{"role": "system", "content": cmd.get("system", "")}]
+    # ONE system message: newer Qwen chat templates raise if any system
+    # message sits anywhere but index 0 — persona, skills, memory-tool and
+    # memory-log blocks all merge into a single leading system prompt.
+    system_parts = [cmd.get("system", "")]
     skills = cmd.get("skills") or []
     if skills:
         blocks = []
@@ -1043,12 +1068,13 @@ def handle_chat(cmd):
                 b += "Why it exists: " + s["why"] + "\n"
             b += "---\n" + s.get("content", "") + "\n---"
             blocks.append(b)
-        msgs.append({"role": "system", "content": SKILLS_HANDLER_PROMPT + "\n\nThe skills:\n\n" + "\n\n".join(blocks)})
+        system_parts.append(SKILLS_HANDLER_PROMPT + "\n\nThe skills:\n\n" + "\n\n".join(blocks))
     if bool(CFG.get("memoryTools", False)):
-        msgs.append({"role": "system", "content": MEMORY_TOOLS_PROMPT})
+        system_parts.append(MEMORY_TOOLS_PROMPT)
         log_lines = mem_state().get("log", [])
         if log_lines:
-            msgs.append({"role": "system", "content": "Memory system results from your last operations:\n" + "\n".join(log_lines[-6:])})
+            system_parts.append("Memory system results from your last operations:\n" + "\n".join(log_lines[-6:]))
+    msgs = [{"role": "system", "content": "\n\n".join(p for p in system_parts if p.strip())}]
 
     # build the LLM message list (media attached to the current user turn;
     # older media replaced with honest placeholders once the budget is spent)
@@ -1179,7 +1205,8 @@ def dispatch(cmd):
     if t == "sleep":
         save_store()
         slog({"ev": "sleeping", "reason": "request"})
-        outbox_push({"ev": "sleeping", "v": cmd.get("v", 0), "last_done": LAST_DONE})
+        outbox_push({"ev": "sleeping", "v": cmd.get("v", 0), "last_done": LAST_DONE,
+                     "mem": {"text": mem_state().get("text", ""), "hash": mem_state().get("hash", "")}})
         time.sleep(1)
         sys.exit(0)
     if t == "config":
@@ -1211,6 +1238,13 @@ def main():
     if CFG.get("visionEnabled", False):
         vision_check_ready()
     slog({"ev": "meta", "phase": "ready"})
+    # durable ready signal — the app may be rate-limited on the log stream,
+    # but the outbox always lands (overwrites the booting announce). Carries
+    # the memory snapshot so engine-side memory edits always reach the app.
+    try:
+        outbox_push({"ev": "ready", "mem": {"text": mem_state().get("text", ""), "hash": mem_state().get("hash", "")}})
+    except Exception as e:
+        err("outbox-ready", e)
     LAST_CMD = time.time()
     last_hb = time.time()
     while True:
@@ -1223,7 +1257,8 @@ def main():
         if time.time() - LAST_CMD > int(CFG.get("afkSeconds", 180)):
             save_store()
             slog({"ev": "sleeping", "reason": "afk"})
-            outbox_push({"ev": "sleeping", "reason": "afk", "last_done": LAST_DONE})
+            outbox_push({"ev": "sleeping", "reason": "afk", "last_done": LAST_DONE,
+                         "mem": {"text": mem_state().get("text", ""), "hash": mem_state().get("hash", "")}})
             time.sleep(1)
             sys.exit(0)
         time.sleep(2)
