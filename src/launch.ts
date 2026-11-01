@@ -37,6 +37,27 @@ export function lanUrls(port: number): string[] {
   return urls;
 }
 
+/**
+ * Windows: detach from the console so no cmd box is left behind the window.
+ *
+ * The binary keeps the console subsystem on purpose — the CLI modes (cli /
+ * chat / tokens / status) must print to the terminal. Only the window mode
+ * detaches, and it does so before anything else runs, so the console window
+ * disappears immediately instead of hanging around in the background.
+ */
+export async function detachConsole(): Promise<void> {
+  if (process.platform !== "win32") return;
+  try {
+    const { dlopen, FFIType } = await import("bun:ffi");
+    const kernel32 = dlopen("kernel32.dll", {
+      FreeConsole: { args: [], returns: FFIType.void },
+    });
+    kernel32.symbols.FreeConsole();
+  } catch {
+    /* no console attached — nothing to detach */
+  }
+}
+
 /** Open the UI in a real window (Edge first on Windows — that's WebView2 under
  *  the hood; chromium-family app mode elsewhere). Falls back to the default browser. */
 export function openAppWindow(url: string): void {

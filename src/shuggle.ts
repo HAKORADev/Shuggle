@@ -20,7 +20,7 @@ import { join, dirname } from "node:path";
 import { VERSION } from "./version.ts";
 import { printBanner } from "./banner.ts";
 import { Server } from "./server/server.ts";
-import { openAppWindow, pickFreePort, localUrls, lanUrls } from "./launch.ts";
+import { openAppWindow, pickFreePort, localUrls, lanUrls, detachConsole } from "./launch.ts";
 
 function arg(i: number): string | undefined {
   return process.argv[i];
