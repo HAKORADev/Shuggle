@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
 cd "$(dirname "$0")"
-exec ./shuggle
+# Arguments pass straight through: ./shuggle.sh cli, ./shuggle.sh chat "hi", …
+exec ./shuggle "$@"

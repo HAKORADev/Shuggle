@@ -13,7 +13,36 @@ export interface Bridge {
 
 const lockName = "server.json";
 
-export async function connectServer(dataDir: string): Promise<Bridge> {
+/** Create the device account if there is none yet (CLI path — the window has a wizard). */
+async function ensureAccount(port: number): Promise<void> {
+  const st = await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();
+  if (st.hasAccount && st.loggedIn) return;
+  if (st.hasAccount) {
+    const password = await promptHidden("  password: ");
+    const lr = await fetch(`http://127.0.0.1:${port}/api/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+    if (!lr.ok) {
+      const j = await lr.json().catch(() => ({ error: "login failed" }));
+      throw new Error(j.error ?? "login failed");
+    }
+    return;
+  }
+  // No account on this device yet — make one.
+  const name = await promptLine("  account name: ");
+  const password = await promptHidden("  password: ");
+  const ar = await fetch(`http://127.0.0.1:${port}/api/account`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, password }),
+  });
+  const aj = await ar.json().catch(() => ({ error: "account creation failed" }));
+  if (!ar.ok || aj.error) throw new Error(aj.error ?? "account creation failed");
+}
+
+export async function connectServer(dataDir: string, opts?: { create?: boolean }): Promise<Bridge> {
   const lockFile = join(dataDir, lockName);
   // 1. try an existing server (health-checked — stale locks are taken over)
   const claimed = await Server.claimLock(dataDir, 0, process.pid).catch(() => null);
@@ -33,10 +62,11 @@ export async function connectServer(dataDir: string): Promise<Bridge> {
       throw new Error(j.error ?? "login failed");
     }
     return { port, owned: false };
-  }
-  // 2. start an embedded server (we now hold the lock on a fresh port)
+  }  // 2. start an embedded server (we now hold the lock on a fresh port)
   const { pickFreePort } = await import("../launch.ts");
-  const port = await pickFreePort(8690);
+  // claimLock() may hand back port 0 (meaning "any free port") — the OS then
+  // picks one at bind time, so we must dial the port Bun actually bound.
+  const port = claimed && claimed.port > 0 ? claimed.port : await pickFreePort(8690);
   await Server.claimLock(dataDir, port, process.pid);
   const server = new Server({
     dataDir,
@@ -45,33 +75,23 @@ export async function connectServer(dataDir: string): Promise<Bridge> {
     appWindow: false,
     onExit: () => process.exit(0),
   });
-  Bun.serve({
+  const srv = Bun.serve({
     port,
     hostname: "127.0.0.1",
     idleTimeout: 255,
     fetch: (req) => server.handle(req),
   });
+  const realPort = srv.port || port;
   server.startPings();
   // process state check + login if needed
-  const st = await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();
-  if (!st.hasAccount) {
-    throw new Error("no account on this device yet — run `shuggle` once to create one");
+  const st = await (await fetch(`http://127.0.0.1:${realPort}/api/state`)).json();
+  if (!st.hasAccount && !opts?.create) {
+    throw new Error("no account on this device yet — create one with:  shuggle account");
   }
-  if (!st.loggedIn) {
-    const password = await promptHidden("  password: ");
-    const lr = await fetch(`http://127.0.0.1:${port}/api/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password }),
-    });
-    if (!lr.ok) {
-      const j = await lr.json().catch(() => ({ error: "login failed" }));
-      throw new Error(j.error ?? "login failed");
-    }
-  }
-  writeFileSync(lockFile, JSON.stringify({ port, pid: process.pid }));
+  await ensureAccount(realPort);
+  writeFileSync(lockFile, JSON.stringify({ port: realPort, pid: process.pid }));
   process.on("exit", () => Server.releaseLock(dataDir, process.pid));
-  return { port, owned: true };
+  return { port: realPort, owned: true };
 }
 
 export function api(port: number) {
@@ -164,6 +184,15 @@ export function question(q: string): Promise<string> {
     const rl = getRl();
     rl.question(q, (a: string) => resolve(a));
   });
+}
+
+/** A plain visible prompt that also works when stdin is a pipe. */
+export function promptLine(q: string): Promise<string> {
+  if (isPiped()) {
+    process.stdout.write(q);
+    return Promise.resolve((nextPipedLine() ?? "").trim());
+  }
+  return question(q);
 }
 
 export function resumeInput(): void {

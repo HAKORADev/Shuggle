@@ -23,6 +23,9 @@ export interface EngineConfig {
   bearer: string;
   owner: string;
   profile: string;
+  /** Storage namespace — profile + device signature. The app and the kernel
+   *  MUST agree on it, or the engine reads someone else's datasets. */
+  ns: string;
   contextTokens: number;
   afkSeconds: number;
   memoryTools: boolean;
@@ -91,7 +94,9 @@ MODEL_DIR = os.path.join(WORK, "model")
 MEDIA_DIR = os.path.join(WORK, "media")
 def _slugns(name):
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:20]
-NS = _slugns(PROFILE)
+# The app owns the namespace (profile + device signature). Fall back to the
+# profile slug only when the app did not send one.
+NS = CFG.get("ns") or _slugns(PROFILE)
 STORE_SLUG = "shuggle-store-" + NS
 INBOX_SLUG = "shuggle-inbox-" + NS
 OUTBOX_SLUG = "shuggle-outbox-" + NS
@@ -473,31 +478,46 @@ def vision_ensure_loaded():
         return False
     if llm is None:
         return False
-    try:
-        import llama_cpp
-        names = ["Qwen3VLChatHandler", "Qwen25VLChatHandler", "Qwen2VLChatHandler", "Llava15ChatHandler"]
-        handler_cls = None
-        picked = None
-        for n in names:
-            if hasattr(llama_cpp, n):
-                handler_cls = getattr(llama_cpp, n)
-                picked = n
-                break
-        if handler_cls is None:
-            VISION["failed"] = "installed engine build has no vision handler"
-            slog({"ev": "vision-unavailable", "d": VISION["failed"]})
-            return False
-        t0 = time.time()
-        VISION["handler"] = handler_cls(VISION["mmproj"])
-        VISION["name"] = picked
-        llm.chat_handler = VISION["handler"]
-        slog({"ev": "vision-ready", "detail": picked, "load_s": round(time.time() - t0, 1)})
-        return True
-    except Exception as e:
-        VISION["failed"] = str(e)[:300]
-        VISION["handler"] = None
-        slog({"ev": "vision-unavailable", "d": VISION["failed"]})
-        return False
+    # Candidates in order of fit for a Qwen3-VL style projector
+    # (clip.projector_type = qwen3vl_merger):
+    #   MTMDChatHandler  — llama.cpp's generic multimodal path (mtmd), the
+    #                      only one that understands qwen3-vl projectors.
+    #   Qwen25VLChatHandler / Qwen2VLChatHandler — explicit Qwen VL formats.
+    #   Llava15ChatHandler — generic LLaVA-style fallback.
+    candidates = [
+        ("MTMDChatHandler", lambda p: _mtmd_handler(p)),
+        ("Qwen3VLChatHandler", lambda p: _cls_handler(p, "Qwen3VLChatHandler")),
+        ("Qwen25VLChatHandler", lambda p: _cls_handler(p, "Qwen25VLChatHandler")),
+        ("Qwen2VLChatHandler", lambda p: _cls_handler(p, "Qwen2VLChatHandler")),
+        ("Llava15ChatHandler", lambda p: _cls_handler(p, "Llava15ChatHandler")),
+    ]
+    errors = []
+    for name, make in candidates:
+        try:
+            t0 = time.time()
+            handler = make(VISION["mmproj"])
+            VISION["handler"] = handler
+            VISION["name"] = name
+            llm.chat_handler = handler
+            slog({"ev": "vision-ready", "detail": name, "load_s": round(time.time() - t0, 1)})
+            return True
+        except Exception as e:
+            errors.append(name + ": " + str(e)[:120])
+    VISION["failed"] = "vision handler unavailable (" + "; ".join(errors) + ")"
+    slog({"ev": "vision-unavailable", "d": VISION["failed"]})
+    return False
+
+
+def _cls_handler(path, cls_name):
+    import llama_cpp
+    cls = getattr(llama_cpp, cls_name)
+    return cls(path)
+
+
+def _mtmd_handler(path):
+    import llama_cpp
+    cls = getattr(llama_cpp, "MTMDChatHandler")
+    return cls(path, verbose=False)
 
 def vision_unload():
     if VISION.get("handler") and llm is not None:

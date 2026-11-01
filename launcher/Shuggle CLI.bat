@@ -1,5 +1,5 @@
 @echo off
-title Shuggle CLI
+title Shuggle - Terminal
 cd /d "%~dp0"
-Shuggle.exe cli
-pause
+rem Interactive chat in this window. Ctrl+C to leave.
+Shuggle.exe cli %*

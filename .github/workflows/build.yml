@@ -45,6 +45,9 @@ jobs:
           bun-version: "1.3.14"
       - name: Bundle UI
         run: bun build src/ui/app.ts --minify --format=iife --outfile=src/ui/app.bundle.js
+      # Console subsystem on purpose: the CLI modes (cli / chat / tokens) print to
+      # the terminal. In window mode the app detaches its console at runtime
+      # (FreeConsole), so there is no black cmd box behind the window.
       - name: Compile single binary
         shell: bash
         # console-subsystem exe: `Shuggle.exe cli` keeps real stdio; GUI mode
@@ -63,6 +66,7 @@ jobs:
           cp Shuggle.exe bundle/
           cp launcher/"Shuggle.bat" bundle/
           cp launcher/"Shuggle CLI.bat" bundle/
+          cp launcher/"Shuggle Ask.bat" bundle/
           cp launcher/"Shuggle LAN.bat" bundle/
       - name: Upload artifact
         uses: actions/upload-artifact@v4

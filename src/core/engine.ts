@@ -26,8 +26,14 @@ export type SlotState = "idle" | "seeding" | "booting" | "waking" | "ready" | "g
 export type VisionState = "unknown" | "ready" | "unavailable" | "off";
 
 /** Profile namespace for private kernel/dataset slugs. */
-export function profileNamespace(profile: string): string {
-  return profile.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 20) || "default";
+export function profileNamespace(profile: string, deviceSignature?: string): string {
+  const base = profile.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 20) || "default";
+  // Two devices signed into the same account must NOT share Kaggle storage —
+  // the relay datasets (inbox/outbox/store) are per device, otherwise one
+  // device's commands overwrite the other's.
+  if (!deviceSignature) return base;
+  const sig = hsh16(deviceSignature);
+  return `${base}-${sig}`.slice(0, 40);
 }
 
 export interface SlotEvent {
@@ -103,11 +109,11 @@ export class EngineSlot {
   private adoptedEngineVersion: string | null = null;
   private upgradedForVersion = false;
 
-  constructor(opts: { username: string; secret: string; profile: string; contextTokens: number; afkSeconds: number; memoryTools: boolean; vision: EngineVisionConfig; events: EventEmitter }) {
+  constructor(opts: { username: string; secret: string; profile: string; deviceSignature?: string; contextTokens: number; afkSeconds: number; memoryTools: boolean; vision: EngineVisionConfig; events: EventEmitter }) {
     this.username = opts.username;
     this.secret = opts.secret;
     this.profile = opts.profile;
-    this.ns = profileNamespace(opts.profile);
+    this.ns = profileNamespace(opts.profile, opts.deviceSignature);
     this.slug = `shuggle-engine-${this.ns}`;
     this.contextTokens = opts.contextTokens;
     this.afkSeconds = opts.afkSeconds;
@@ -184,6 +190,19 @@ export class EngineSlot {
     return this.kaggle.datasetExists(this.username, "shuggle-model");
   }
 
+  /** The vision projector lives in its own small dataset so a 17 GB model
+   *  never has to be re-uploaded just to add (or fix) the projector. */
+  async visionDatasetReady(): Promise<boolean> {
+    return this.kaggle.datasetExists(this.username, "shuggle-vision");
+  }
+
+  /** Datasets the engine kernel must mount. */
+  private async engineSources(): Promise<string[]> {
+    const sources = [`${this.username}/shuggle-model`];
+    if (await this.visionDatasetReady()) sources.push(`${this.username}/shuggle-vision`);
+    return sources;
+  }
+
   /** Push (or re-push) the engine notebook and wait for it to be ready.
    *  force=true re-pushes even if a session is alive (the Restart button). */
   async boot(record: TokenRecord, force = false): Promise<void> {
@@ -238,10 +257,16 @@ export class EngineSlot {
     if (!(await this.modelDatasetReady())) {
       await this.seedModel(record);
     }
+    // The projector is a separate, tiny download — seed it on its own so the
+    // big model never gets re-uploaded.
+    if (!(await this.visionDatasetReady())) {
+      await this.seedVision(record);
+    }
     const script = engineScript({
       bearer: this.secret,
       owner: this.username,
       profile: this.profile,
+      ns: this.ns,
       contextTokens: this.contextTokens,
       afkSeconds: this.afkSeconds,
       memoryTools: this.memoryTools,
@@ -257,7 +282,7 @@ export class EngineSlot {
       gpu: true,
       internet: true,
       machineShape: "NvidiaTeslaT4",
-      datasetSources: [`${this.username}/shuggle-model`],
+      datasetSources: await this.engineSources(),
       timeoutSeconds: 3600 * 6,
     });
     this.slug = res.slug;
@@ -284,16 +309,54 @@ export class EngineSlot {
    *  projector once and stores them as a private dataset on this account.
    *  If a seed kernel is already running (app restarted mid-seed), adopt it. */
   private async seedModel(record: TokenRecord): Promise<void> {
-    this.setState("seeding", "Setting up your model (one time only — about 10–20 minutes)");
+    await this.seedInto({
+      label: "model",
+      dataset: "shuggle-model",
+      title: "Shuggle Model",
+      description: "Shuggle engine model storage (weights). Managed automatically.",
+      files: [["Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 16.8]],
+      stateText: "Setting up your model (one time only — about 10–20 minutes)",
+    });
+  }
+
+  /** The vision projector (mmproj) — a small, separate download. */
+  private async seedVision(record: TokenRecord): Promise<void> {
+    await this.seedInto({
+      label: "vision",
+      dataset: "shuggle-vision",
+      title: "Shuggle Vision",
+      description: "Shuggle vision projector for image and video understanding. Managed automatically.",
+      files: [["mmproj-Qwen3.8-27B-Uncensored-F16.gguf", 0.92]],
+      stateText: "Setting up image understanding (one time only — about a minute)",
+    });
+  }
+
+  /** Download a set of files from Hugging Face and store them as a private
+   *  dataset on this account. One dataset per file group so a small file
+   *  never forces a re-upload of a huge one. */
+  private async seedInto(opts: {
+    label: string;
+    dataset: string;
+    title: string;
+    description: string;
+    files: [string, number][];
+    stateText: string;
+  }): Promise<void> {
+    this.setState("seeding", opts.stateText);
     this.emit("seed", { phase: "start" });
-    let slug = "shuggle-model-seed";
+    let slug = `shuggle-${opts.label}-seed`;
     const existing = await this.kaggle.kernelStatus(this.username, slug);
     if (existing.status !== "RUNNING") {
-      const seedScript = SEED_SCRIPT.replace("__BEARER__", this.secret).replace("__OWNER__", this.username);
+      const seedScript = SEED_SCRIPT.replace("__BEARER__", this.secret)
+        .replace("__OWNER__", this.username)
+        .replace("__DATASET__", opts.dataset)
+        .replace("__TITLE__", opts.title)
+        .replace("__DESCRIPTION__", opts.description)
+        .replace("__FILES__", JSON.stringify(opts.files));
       const res = await this.kaggle.pushKernel({
         owner: this.username,
         slug,
-        title: "Shuggle Model Seed",
+        title: `Shuggle ${opts.label === "vision" ? "Vision" : "Model"} Seed`,
         script: seedScript,
         run: true,
         gpu: false,
@@ -824,10 +887,10 @@ import json, os, sys, time, urllib.request, urllib.error
 BEARER = "__BEARER__"
 OWNER = "__OWNER__"
 REPO_ID = "JonathanColetti/Qwen3.8-27B-Uncensored-GGUF"
-FILES = [
-    ("Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 16.8),
-    ("mmproj-Qwen3.8-27B-Uncensored-F16.gguf", 0.46),
-]
+DATASET = "__DATASET__"
+TITLE = "__TITLE__"
+DESCRIPTION = "__DESCRIPTION__"
+FILES = __FILES__
 BASE = "https://www.kaggle.com/api/v1"
 CHUNK = 64 * 1024 * 1024
 
@@ -889,21 +952,21 @@ for FILENAME, GB in FILES:
                 slog("Uploaded " + str(round(sent / 1e9, 2)) + " / " + str(round(size / 1e9, 2)) + " GB (" + str(int(rate)) + " MB/s)")
     tokens.append({"token": j["token"], "description": FILENAME, "columns": []})
     os.remove(path)
-slog("Storing as your private model dataset")
+slog("Storing as your private " + DATASET + " dataset")
 try:
-    st = rpc("datasets.DatasetApiService/GetDatasetStatus", {"ownerSlug": OWNER, "datasetSlug": "shuggle-model"})
+    st = rpc("datasets.DatasetApiService/GetDatasetStatus", {"ownerSlug": OWNER, "datasetSlug": DATASET})
     exists = "NOT_FOUND" not in json.dumps(st)
 except Exception:
     exists = False
 body = {"files": tokens,
-        "subtitle": "Shuggle engine model",
-        "description": "Shuggle engine model storage (weights + vision projector). Managed automatically.",
+        "subtitle": "Shuggle engine storage",
+        "description": DESCRIPTION,
         "categoryIds": [], "versionNotes": "seed"}
 if exists:
-    rpc("datasets.DatasetApiService/CreateDatasetVersion", {"ownerSlug": OWNER, "datasetSlug": "shuggle-model", "body": body}, 900)
+    rpc("datasets.DatasetApiService/CreateDatasetVersion", {"ownerSlug": OWNER, "datasetSlug": DATASET, "body": body}, 900)
 else:
-    rpc("datasets.DatasetApiService/CreateDataset", {"ownerSlug": OWNER, "slug": "shuggle-model", "title": "Shuggle Model",
+    rpc("datasets.DatasetApiService/CreateDataset", {"ownerSlug": OWNER, "slug": DATASET, "title": TITLE,
         "licenseName": "CC0-1.0", "isPrivate": True, **body}, 900)
-slog("Setup complete — the model now loads instantly on every boot")
+slog("Setup complete — " + DATASET + " now loads instantly on every boot")
 print("SEED_DONE", flush=True)
 `;

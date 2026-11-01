@@ -5,6 +5,7 @@
 //   shuggle cli          → interactive chat in the terminal
 //   shuggle chat [id] …  → one-line chat
 //   shuggle tokens …     → manage Kaggle tokens
+//   shuggle account      → create this device's account
 //   shuggle status       → engines at a glance
 //   shuggle help         → this list
 //
@@ -19,16 +20,28 @@ import { join, dirname } from "node:path";
 import { VERSION } from "./version.ts";
 import { printBanner } from "./banner.ts";
 import { Server } from "./server/server.ts";
-import { openAppWindow, pickFreePort, localUrls, lanUrls } from "./launch.ts";
+import { openAppWindow, pickFreePort, localUrls, lanUrls, detachConsole } from "./launch.ts";
 
 function arg(i: number): string | undefined {
   return process.argv[i];
 }
-const args = process.argv.slice(2);
-const hasFlag = (f: string) => args.includes(f);
+
+// Global flags may appear BEFORE the command (launchers pass --data=…), so
+// they are pulled out first. Anything else is positional and belongs to the
+// command — a chat message may legitimately start with a dash.
+const RAW_ARGS = process.argv.slice(2);
+const GLOBAL_FLAG_PREFIXES = ["--data=", "--port="];
+const GLOBAL_FLAGS = ["--lan", "lan", "--version", "-v"];
+const args: string[] = [];
+const globals: string[] = [];
+for (const a of RAW_ARGS) {
+  if (GLOBAL_FLAG_PREFIXES.some((p) => a.startsWith(p)) || GLOBAL_FLAGS.includes(a)) globals.push(a);
+  else args.push(a);
+}
+const hasFlag = (f: string) => globals.includes(f);
 
 function dataDir(): string {
-  const custom = args.find((a) => a.startsWith("--data="))?.split("=")[1];
+  const custom = globals.find((a) => a.startsWith("--data="))?.split("=")[1];
   if (custom) return custom;
   // Next to the executable, like every HAKORA tool: one folder, everything inside.
   const invoked = process.argv[1] ?? "";
@@ -73,7 +86,7 @@ function crashLog(e: unknown): void {
 }
 
 function portFromFlags(defaultPort: number): number {
-  const p = args.find((a) => a.startsWith("--port="))?.split("=")[1];
+  const p = globals.find((a) => a.startsWith("--port="))?.split("=")[1];
   return p ? parseInt(p, 10) || defaultPort : defaultPort;
 }
 
@@ -114,9 +127,13 @@ async function main(): Promise<void> {
         idleTimeout: 255, // long engine operations stream via SSE, but keep room
         fetch: (req) => server.handle(req),
       });
+      const realPort = srv.port || port;
+      // Record the port we actually bound — the lock is what other processes
+      // (CLI, second launch) use to find this server.
+      await Server.claimLock(dataDir(), realPort, process.pid);
       server.startPings();
       printBanner();
-      const urls = lan ? lanUrls(port) : localUrls(port);
+      const urls = lan ? lanUrls(realPort) : localUrls(realPort);
       console.log("");
       if (lan) {
         console.log("  Shuggle is open to your local network:");
@@ -159,6 +176,13 @@ async function main(): Promise<void> {
       await runTokensCommand({ dataDir: dataDir(), args: args.slice(1) });
       break;
     }
+    case "account": {
+      const { initPiped } = await import("./cli/bridge.ts");
+      initPiped();
+      const { runAccountCommand } = await import("./cli/account_cmd.ts");
+      await runAccountCommand({ dataDir: dataDir() });
+      break;
+    }
     case "status": {
       const { initPiped } = await import("./cli/bridge.ts");
       await initPiped();
@@ -184,6 +208,7 @@ async function main(): Promise<void> {
     shuggle chat 3 "text"      Ask in chat #3
     shuggle tokens add <tok>   Add a Kaggle token
     shuggle tokens list        Show the token pool
+    shuggle account            Create this device's account
     shuggle status             Engines at a glance
     shuggle help               Show this help
 
