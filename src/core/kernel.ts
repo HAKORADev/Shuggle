@@ -23,6 +23,7 @@ export interface EngineConfig {
   bearer: string;
   owner: string;
   profile: string;
+  ns?: string; // explicit namespace (device-namespace aware) — derived from the profile when absent
   runId: string;
   contextTokens: number;
   afkSeconds: number;
@@ -93,7 +94,10 @@ MODEL_DIR = os.path.join(WORK, "model")
 MEDIA_DIR = os.path.join(WORK, "media")
 def _slugns(name):
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:20]
-NS = _slugns(PROFILE)
+NS = CFG.get("ns")
+if not NS:
+    NS = _slugns(PROFILE)
+NS = str(NS)[:20]
 STORE_SLUG = "shuggle-store-" + NS
 INBOX_SLUG = "shuggle-inbox-g2-" + NS
 OUTBOX_SLUG = "shuggle-outbox-g2-" + NS

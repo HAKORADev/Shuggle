@@ -19,6 +19,17 @@ The whole thing, for the first time:
 - CLI: `shuggle cli` for real conversations in the terminal, `shuggle chat "..."` for one-shot asks — same account, same history.
 - LAN mode: `.bat`/`.sh` launchers open Shuggle to your local network so anyone on your Wi-Fi can use it in their browser.
 
+## Unreleased (this round)
+
+Fixes found by actually running it, end to end, on real GPUs:
+
+- The shipped app opened a **blank window** — the UI assets were read from disk, and a single-file executable has no `src/ui` folder. They are compiled into the binary now.
+- The CLI was dead on arrival: global flags swallowed the command word, the embedded server dialled port 0, and every send threw `slot is not defined` before the model was reached.
+- A pending reply now survives the engine falling asleep (it wakes again instead of failing the turn), and a dead engine no longer looks alive — the log stream replays, so the app now asks and waits for the answer.
+- The memory parser read only the first note (a JavaScript regex has no `\Z`), so edit / delete / undo never matched later ones.
+- The Windows artifact shipped `.sh` launchers; the `.bat` launchers dropped their arguments, so there was no CLI mode behind them.
+- Rate limits, GPU-session limits and missing tokens now say what actually happened instead of a generic apology.
+
 ## v0.5.0 — alpha refresh (build fixes + live-fire hardening)
 
 Fixes from the first real-machine test round:

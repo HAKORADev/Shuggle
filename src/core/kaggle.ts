@@ -220,6 +220,7 @@ export class Kaggle {
   async listMyDatasets(): Promise<{ ref: string; title: string }[]> {
     const r = await fetch(`${BASE}/datasets/list?group=my&pageSize=100&sortBy=updated`, {
       headers: this.headers(),
+      signal: AbortSignal.timeout(90_000),
     });
     if (!r.ok) return [];
     const arr = (await r.json()) as any[];
@@ -247,6 +248,7 @@ export class Kaggle {
       method: "PUT",
       headers: { "Content-Type": "application/octet-stream" },
       body: content as any,
+      signal: AbortSignal.timeout(300_000),
     });
     if (put.status !== 200 && put.status !== 201) {
       throw new KaggleError(`blob put: HTTP ${put.status}`);
@@ -303,6 +305,7 @@ export class Kaggle {
         headers: this.headers(),
         body: JSON.stringify({ ownerSlug: owner, datasetSlug: slug, fileName, raw: true }),
         redirect: "follow",
+        signal: AbortSignal.timeout(120_000),
       });
       if (r.status === 429) this.coolUntil = Date.now() + 45_000;
       if (r.status === 404) return null;

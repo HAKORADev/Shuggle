@@ -56,6 +56,10 @@ export async function runOneLine(opts: { dataDir: string; args: string[] }): Pro
     const full = (await a.get(`/api/sessions/${target.id}`)) as any;
     const sess = full?.session;
     if (!sess) break;
+    if (r.userMsgId && sess.nodes[r.userMsgId]?.error) {
+      console.error(`  ${sess.nodes[r.userMsgId].error}`);
+      process.exit(1);
+    }
     const ids: string[] = [];
     let cur = sess.activeRoot;
     while (cur) {
@@ -67,6 +71,16 @@ export async function runOneLine(opts: { dataDir: string; args: string[] }): Pro
       .slice(uIdx + 1)
       .map((id: string) => sess.nodes[id])
       .find((n: any) => n?.role === "assistant");
+    // The failure lands on the ASSISTANT node — check that one too, or a
+    // failed turn looks like a hang.
+    const failedNode = ids
+      .slice(uIdx + 1)
+      .map((id: string) => sess.nodes[id])
+      .find((n: any) => n?.error);
+    if (failedNode?.error) {
+      console.error(`  ${failedNode.error}`);
+      process.exit(1);
+    }
     if (!assistant) continue;
     const think = assistant.thinking ?? "";
     const body = assistant.content ?? "";
@@ -98,7 +112,13 @@ export async function runStatus(opts: { dataDir: string }): Promise<void> {
   try {
     bridge = await connectServer(opts.dataDir);
   } catch (e: any) {
-    console.error(`  ${e.message}`);
+    const msg = String(e?.message ?? e);
+    // "No account yet" is a healthy state for a status glance, not a failure.
+    if (/no account/i.test(msg)) {
+      console.log(`\n  ${msg}\n  Chats: 0\n`);
+      process.exit(0);
+    }
+    console.error(`  ${msg}`);
     process.exit(1);
   }
   const a = api(bridge.port);

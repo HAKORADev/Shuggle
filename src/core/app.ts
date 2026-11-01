@@ -13,7 +13,6 @@ import { MemoryEntry } from "./memory.ts";
 
 export interface MemoryState {
   text: string;
-  rev: number; // monotonic memory revision — newest edit wins, stale replays never rewind
   history: MemoryEntry[];
 }
 
@@ -45,36 +44,43 @@ export class AppContext {
   // ---- persistence -------------------------------------------------------
 
   save(domain: "sessions" | "settings" | "tokens" | "memory" | "memhist", delay = 400): void {
+    if (delay <= 0) {
+      // small critical domains (tokens, memory) flush immediately — other
+      // processes (CLI) may read the vault at any moment
+      this.flushDomain(domain);
+      return;
+    }
     const prev = this.saveTimers.get(domain);
     if (prev) clearTimeout(prev);
-    this.saveTimers.set(
-      domain,
-      setTimeout(() => {
-        this.saveTimers.delete(domain);
-        if (!this.profile) return;
-        try {
-          switch (domain) {
-            case "sessions":
-              this.profile.writeSessions(this.sessions);
-              break;
-            case "settings":
-              this.profile.writeSettings(this.settings);
-              break;
-            case "tokens":
-              this.profile.writeTokens(this.tokens);
-              break;
-            case "memory":
-              this.profile.writeMemoryRaw({ text: this.memory.text, rev: this.memory.rev });
-              break;
-            case "memhist":
-              this.profile.writeMemoryHistory(this.memory.history);
-              break;
-          }
-        } catch {
-          /* disk hiccup — retried on next change */
-        }
-      }, delay),
-    );
+    this.saveTimers.set(domain, setTimeout(() => {
+      this.saveTimers.delete(domain);
+      this.flushDomain(domain);
+    }, delay));
+  }
+
+  private flushDomain(domain: string): void {
+    if (!this.profile) return;
+    try {
+      switch (domain) {
+        case "sessions":
+          this.profile.writeSessions(this.sessions);
+          break;
+        case "settings":
+          this.profile.writeSettings(this.settings);
+          break;
+        case "tokens":
+          this.profile.writeTokens(this.tokens);
+          break;
+        case "memory":
+          this.profile.writeMemoryRaw({ text: this.memory.text, rev: this.memory.rev });
+          break;
+        case "memhist":
+          this.profile.writeMemoryHistory(this.memory.history);
+          break;
+      }
+    } catch {
+      /* disk hiccup — retried on next change */
+    }
   }
 
   saveNow(): void {
@@ -119,10 +125,9 @@ export class AppContext {
     const stored = p.readSettings<Partial<GlobalSettings>>({});
     this.settings = clampSettings({ ...defaultSettings(), ...stored, fancy: { ...defaultSettings().fancy, ...(stored.fancy ?? {}) } });
     this.tokens = p.readTokens(emptyPool());
-    const memRaw = p.readMemoryRaw<{ text?: string; rev?: number }>({ text: "" });
     this.memory = {
-      text: memRaw.text ?? "",
-      rev: memRaw.rev ?? 0,
+      text: p.readMemoryText(""),
+      rev: 0,
       history: p.readMemoryHistory<MemoryEntry[]>([]),
     };
     this.events.emit("changed");
@@ -146,6 +151,7 @@ export class AppContext {
   // ---- engines -----------------------------------------------------------
 
   slotFor(username: string): EngineSlot {
+    if (process.env.SHUGGLE_DEBUG) console.error(`[app] slotFor ${username}`);
     let slot = this.slots.get(username);
     if (!slot) {
       const rec = this.tokens.tokens.find((t) => t.id === username);
@@ -154,11 +160,12 @@ export class AppContext {
         username,
         secret: rec.secret,
         profile: this.profile?.name ?? "default",
+        deviceSignature: this.device.signature,
         contextTokens: this.settings.contextTokens,
         afkSeconds: this.settings.afkMinutes * 60,
-        memoryTools: this.settings.memoryTools,
+        memoryTools: !!this.settings.memoryTools,
         vision: {
-          enabled: this.settings.vision.enabled,
+          enabled: !!this.settings.vision.enabled,
           maxFrames: this.settings.vision.maxFrames,
           frameSeconds: this.settings.vision.frameSeconds,
           mediaTokenBudget: this.settings.mediaTokenBudget,
@@ -166,7 +173,6 @@ export class AppContext {
         events: this.events,
       });
       this.slots.set(username, slot);
-      slot.attachRelay();
     }
     return slot;
   }

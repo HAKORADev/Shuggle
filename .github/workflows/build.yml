@@ -83,6 +83,7 @@ jobs:
           cp Shuggle.exe bundle/
           cp launcher/"Shuggle.bat" bundle/
           cp launcher/"Shuggle CLI.bat" bundle/
+          cp launcher/"Shuggle Ask.bat" bundle/
           cp launcher/"Shuggle LAN.bat" bundle/
       - name: Upload artifact
         uses: actions/upload-artifact@v4

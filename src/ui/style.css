@@ -559,3 +559,14 @@ textarea.mem-edit:focus { border-color: var(--accent-strong); box-shadow: 0 0 0 
 /* in-app link viewer */
 .link-viewer iframe { width: 100%; height: 66vh; border: 0; border-radius: 10px; background: #fff; }
 .link-note { font-size: 12px; color: var(--dim, #9aa0a6); line-height: 1.5; }
+/* Per-chat skill picker */
+.skill-picker { display: flex; flex-direction: column; gap: 6px; }
+.skill-pick-row { display: flex; align-items: flex-start; gap: 10px; padding: 9px 11px;
+  border: 1px solid var(--line); border-radius: 9px; cursor: pointer;
+  transition: border-color .15s ease, background .15s ease; }
+.skill-pick-row:hover { border-color: var(--text-faint); }
+.skill-pick-row input { margin-top: 2px; accent-color: var(--accent); }
+.skill-pick-row .sp-text { display: flex; flex-direction: column; gap: 2px; }
+.skill-pick-row .sp-text b { font-size: 13px; font-weight: 600; }
+.skill-pick-row .sp-text i { font-style: normal; font-size: 12px; color: var(--text-faint); }
+.skill-pick-row input:disabled ~ .sp-text b { opacity: .45; }
