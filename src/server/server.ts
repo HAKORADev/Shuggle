@@ -36,7 +36,18 @@ export class Server {
   private sessionCookie: string | null = null;
   private lastActivity = Date.now();
   private tasks = new Map<string, ChatTask>(); // sid -> in-flight task
+  private pendingSends = new Set<string>(); // synchronous send gate — three concurrent POSTs used to slip past the async task check
   private pingTimer: NodeJS.Timeout | null = null;
+
+  /** Synchronous mutex: true when the gate was free (and is now held). */
+  private gate(sids: string): boolean {
+    if (this.pendingSends.has(sids) || this.tasks.has(sids)) return false;
+    this.pendingSends.add(sids);
+    return true;
+  }
+  private ungate(sids: string): void {
+    this.pendingSends.delete(sids);
+  }
 
   constructor(
     private opts: { dataDir: string; port: number; lan: boolean; appWindow: boolean; onExit: () => void },
@@ -678,6 +689,17 @@ export class Server {
   }
 
   private async send(s: SessionData, text: string, attachments: any[], media: IncomingMedia[] = []): Promise<Response> {
+    // synchronous duplicate gate: three concurrent POSTs once slipped past
+    // the async task check and triple-fired the engine command
+    if (!this.gate(s.id)) return this.json({ error: "still answering the previous message" }, 409);
+    try {
+      return await this.sendInner(s, text, attachments, media);
+    } finally {
+      this.ungate(s.id);
+    }
+  }
+
+  private async sendInner(s: SessionData, text: string, attachments: any[], media: IncomingMedia[] = []): Promise<Response> {
     try {
       let full = text;
       let meta: any[] = [];
