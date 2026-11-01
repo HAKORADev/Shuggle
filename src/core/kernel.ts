@@ -803,7 +803,8 @@ def mem_blocks():
 def mem_set_text(new_text):
     mem_state()["text"] = new_text
     mem_state()["hash"] = hsh(new_text)
-    slog({"ev": "mem", "hash": mem_state()["hash"], "text": new_text})
+    mem_state()["rev"] = int(time.time() * 1000)
+    slog({"ev": "mem", "hash": mem_state()["hash"], "text": new_text, "rev": mem_state()["rev"]})
 
 def mem_log(line):
     log = mem_state().setdefault("log", [])
@@ -980,11 +981,18 @@ def serialize_mem_blocks(blocks):
 def handle_mem(cmd):
     if cmd["type"] == "mem_set":
         mem = mem_state()
+        rev = int(cmd.get("rev", 0))
+        if rev and rev < int(mem.get("rev", 0) or 0):
+            # a stale replay of an older edit must never rewind memory
+            err("mem-stale", "ignoring mem_set rev " + str(rev) + " <= " + str(mem.get("rev")))
+            return
         mem["text"] = cmd.get("text", "")
         mem["hash"] = cmd.get("hash", "")
+        if rev:
+            mem["rev"] = rev
         if cmd.get("deleted") is not None:
             mem["deleted"] = cmd.get("deleted", [])
-        slog({"ev": "mem", "hash": mem["hash"]})
+        slog({"ev": "mem", "hash": mem["hash"], "text": mem["text"], "rev": mem.get("rev", 0)})
         save_store()
     elif cmd["type"] == "mem_get":
         mem = mem_state()
@@ -1063,10 +1071,14 @@ def handle_chat(cmd):
     while total_chars(hist, len(cmd.get("system", ""))) > limit and len(hist) > 3:
         hist.pop(0)
 
-    if cmd.get("memory_text") is not None and cmd.get("memory_hash") is not None:
-        if mem_state().get("hash") != cmd["memory_hash"]:
-            mem_state()["text"] = cmd["memory_text"]
-            mem_state()["hash"] = cmd["memory_hash"]
+    # Bootstrap only: the engine's store is the source of truth for memory
+    # (stale CDN replays of old commands must never rewind it - seen live).
+    # The app pushes its copy only to seed a brand-new engine store.
+    if cmd.get("memory_text") and not mem_state().get("text"):
+        mem_state()["text"] = cmd["memory_text"]
+        mem_state()["hash"] = cmd.get("memory_hash", "")
+        if cmd.get("memory_rev"):
+            mem_state()["rev"] = int(cmd["memory_rev"])
 
     # ONE system message: newer Qwen chat templates raise if any system
     # message sits anywhere but index 0 — persona, skills, memory-tool and
@@ -1221,7 +1233,7 @@ def dispatch(cmd):
         save_store()
         slog({"ev": "sleeping", "reason": "request"})
         outbox_push({"ev": "sleeping", "v": cmd.get("v", 0), "last_done": LAST_DONE,
-                     "mem": {"text": mem_state().get("text", ""), "hash": mem_state().get("hash", "")}})
+                     "mem": {"text": mem_state().get("text", ""), "hash": mem_state().get("hash", ""), "rev": int(mem_state().get("rev", 0) or 0)}})
         time.sleep(1)
         sys.exit(0)
     if t == "config":
@@ -1257,7 +1269,7 @@ def main():
     # but the outbox always lands (overwrites the booting announce). Carries
     # the memory snapshot so engine-side memory edits always reach the app.
     try:
-        outbox_push({"ev": "ready", "mem": {"text": mem_state().get("text", ""), "hash": mem_state().get("hash", "")}})
+        outbox_push({"ev": "ready", "mem": {"text": mem_state().get("text", ""), "hash": mem_state().get("hash", ""), "rev": int(mem_state().get("rev", 0) or 0)}})
     except Exception as e:
         err("outbox-ready", e)
     LAST_CMD = time.time()
@@ -1275,7 +1287,7 @@ def main():
             save_store()
             slog({"ev": "sleeping", "reason": "afk"})
             outbox_push({"ev": "sleeping", "reason": "afk", "last_done": LAST_DONE,
-                         "mem": {"text": mem_state().get("text", ""), "hash": mem_state().get("hash", "")}})
+                         "mem": {"text": mem_state().get("text", ""), "hash": mem_state().get("hash", ""), "rev": int(mem_state().get("rev", 0) or 0)}})
             time.sleep(1)
             sys.exit(0)
         time.sleep(2)

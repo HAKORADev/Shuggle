@@ -184,12 +184,15 @@ export class Server {
         this.broadcast("vision", { slot, state: ev.state, detail: ev.detail ?? null });
         break;
       case "mem": {
-        // Engine-side memory operations changed the memory text — mirror it.
-        if (typeof ev.text === "string") {
+        // Engine-side memory operations changed the memory text — mirror it,
+        // but never rewind: only adopt revisions newer than what we have.
+        const rev = typeof ev.rev === "number" ? ev.rev : 0;
+        if (typeof ev.text === "string" && rev >= (this.app.memory.rev ?? 0)) {
           this.app.memory.text = ev.text;
+          this.app.memory.rev = Math.max(this.app.memory.rev ?? 0, rev);
           this.persist("memory");
           this.broadcast("memory-updated", { hash: ev.hash ?? null, text: ev.text });
-        } else {
+        } else if (typeof ev.text !== "string") {
           this.broadcast("memory-touched", { hash: ev.hash ?? null });
         }
         break;
@@ -550,7 +553,12 @@ export class Server {
         return this.fail(`memories are limited to ${this.app.settings.memoryMaxChars} characters`);
       }
       this.app.memory.text = text;
+      this.app.memory.rev = Date.now(); // explicit user edit — newest revision wins everywhere
       this.persist("memory");
+      // push the edit to every live engine (stale replays can never rewind it)
+      for (const slot of this.app.slots.values()) {
+        void slot.setMemory(text, hsh16(text), this.app.memory.rev).catch(() => {});
+      }
       return this.json({ ok: true });
     }
 
@@ -755,6 +763,7 @@ export class Server {
         search: { enabled: s.searchEnabled, max_queries: g.searchMaxQueries, pages_per_query: g.searchPagesPerQuery },
         memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
         memoryText: s.memoryEnabled ? this.app.memory.text : null,
+        memoryRev: s.memoryEnabled ? this.app.memory.rev : 0,
         thinking: s.thinkingEnabled,
         skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
         media: mediaFiles.length ? mediaFiles.map((m) => ({ name: m.name, kind: m.kind, file: m.file, bytes: m.bytes })) : undefined,
@@ -822,6 +831,7 @@ export class Server {
         search: { enabled: s.searchEnabled, max_queries: g.searchMaxQueries, pages_per_query: g.searchPagesPerQuery },
         memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
         memoryText: s.memoryEnabled ? this.app.memory.text : null,
+        memoryRev: s.memoryEnabled ? this.app.memory.rev : 0,
         thinking: s.thinkingEnabled,
         skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
       };
@@ -902,6 +912,7 @@ export class Server {
         search: { enabled: s.searchEnabled, max_queries: g.searchMaxQueries, pages_per_query: g.searchPagesPerQuery },
         memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
         memoryText: s.memoryEnabled ? this.app.memory.text : null,
+        memoryRev: s.memoryEnabled ? this.app.memory.rev : 0,
         thinking: s.thinkingEnabled,
         skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
       };

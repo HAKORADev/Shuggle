@@ -186,11 +186,11 @@ export class Profile {
   writeSessions(v: any): void {
     this.writeDomain("sessions", v);
   }
-  readMemoryText(fallback: string): string {
-    return this.readDomain("memory", { text: fallback }).text;
+  readMemoryRaw<T extends { text?: string }>(fallback: T): T {
+    return this.readDomain<T>("memory", fallback);
   }
-  writeMemoryText(text: string): void {
-    this.writeDomain("memory", { text });
+  writeMemoryRaw(v: { text: string; rev: number }): void {
+    this.writeDomain("memory", v);
   }
   readMemoryHistory<T>(fallback: T): T {
     return this.readDomain("memhist", fallback);

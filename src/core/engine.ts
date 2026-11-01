@@ -49,6 +49,7 @@ export interface ChatTurn {
   search?: { enabled: boolean; max_queries: number; pages_per_query: number };
   memoryHash: string | null;
   memoryText: string | null;
+  memoryRev?: number;
   thinking: boolean;
   skills?: { title: string; when: string; why: string; content: string }[];
   media?: MediaItem[]; // images/videos traveling with this turn
@@ -458,14 +459,14 @@ export class EngineSlot {
           this.setState("ready");
           if (j.mem?.hash && j.mem.hash !== this.memHash) {
             this.memHash = j.mem.hash;
-            this.emit("mem", { hash: j.mem.hash, text: j.mem.text ?? null });
+            this.emit("mem", { hash: j.mem.hash, text: j.mem.text ?? null, rev: j.mem.rev ?? 0 });
           }
           return;
         }
         if (j.mem?.hash && j.mem.hash !== this.memHash) {
           // engine-side memory edits (memory tools) — durable sync
           this.memHash = j.mem.hash;
-          this.emit("mem", { hash: j.mem.hash, text: j.mem.text ?? null });
+          this.emit("mem", { hash: j.mem.hash, text: j.mem.text ?? null, rev: j.mem.rev ?? 0 });
         }
         if ((j.ev === "done" && j.sid) || (j.ev === "sleeping" && j.last_done?.sid)) {
           // authoritative turn completion (log stream may have been missed)
@@ -748,6 +749,7 @@ export class EngineSlot {
         search: turn.search ?? { enabled: false, max_queries: 3, pages_per_query: 1 },
         memory_hash: turn.memoryHash,
         memory_text: turn.memoryText,
+        memory_rev: turn.memoryRev ?? 0,
         thinking: turn.thinking,
         skills: turn.skills ?? [],
         media: mediaMeta.length ? mediaMeta : undefined,
@@ -761,9 +763,9 @@ export class EngineSlot {
     await this.sendCmd({ type: "edit_path", sid, history });
   }
 
-  async setMemory(text: string, hash: string, deleted?: any[]): Promise<void> {
+  async setMemory(text: string, hash: string, rev: number, deleted?: any[]): Promise<void> {
     this.memHash = hash;
-    await this.sendCmd({ type: "mem_set", text, hash, deleted: deleted ?? [] });
+    await this.sendCmd({ type: "mem_set", text, hash, rev, deleted: deleted ?? [] });
   }
 
   /** Live engine configuration — applied on the next loop tick, NO restart.
