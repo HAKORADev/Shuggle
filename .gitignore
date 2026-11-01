@@ -7,3 +7,4 @@ node_modules/
 shuggle
 ShuggleData/
 app.bundle.js
+build/ui-test.png
