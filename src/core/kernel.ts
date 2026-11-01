@@ -23,6 +23,7 @@ export interface EngineConfig {
   bearer: string;
   owner: string;
   profile: string;
+  runId: string;
   contextTokens: number;
   afkSeconds: number;
   memoryTools: boolean;
@@ -94,8 +95,8 @@ def _slugns(name):
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:20]
 NS = _slugns(PROFILE)
 STORE_SLUG = "shuggle-store-" + NS
-INBOX_SLUG = "shuggle-inbox-" + NS
-OUTBOX_SLUG = "shuggle-outbox-" + NS
+INBOX_SLUG = "shuggle-inbox-g2-" + NS
+OUTBOX_SLUG = "shuggle-outbox-g2-" + NS
 
 SEARCH_QUERIES_PROMPT = (
     "You generate web search queries. Given the conversation and the user's latest "
@@ -233,18 +234,32 @@ def save_store(retries=2):
 
 # --------------------------------------------------------------- inbox ----
 SEEN_V = 0
+READ_FAILS = 0
 
 def read_cmd():
-    global SEEN_V
+    global SEEN_V, READ_FAILS
     try:
         raw = _download_bytes(OWNER, INBOX_SLUG, "cmd.json", timeout=30)
+        READ_FAILS = 0
         cmd = json.loads(raw.decode())
         if not isinstance(cmd, dict):
+            return None
+        # run_id gate: commands from OTHER app runs (stale CDN reads of old
+        # inbox versions are a real, observed thing) are ignored entirely -
+        # they must never advance the command cursor or dispatch anything.
+        if cmd.get("run_id") != CFG.get("runId", ""):
+            if cmd.get("type"):
+                err("inbox-stale", "ignoring command from another app run (v=" + str(cmd.get("v")) + ")")
             return None
         if cmd.get("v", 0) <= SEEN_V:
             return None
         return cmd
     except Exception:
+        # rate limits and hiccups happen - hammering the inbox every 2s keeps
+        # the limit hot and starves the app's own polling; back off instead
+        READ_FAILS += 1
+        if READ_FAILS >= 3:
+            time.sleep(min(30, 2 * READ_FAILS))
         return None
 
 def fetch_media(file_name):
@@ -1252,9 +1267,11 @@ def main():
         if cmd:
             dispatch(cmd)
         if time.time() - last_hb > 45:
-            slog({"ev": "hb"})
+            slog({"ev": "hb", "v": SEEN_V})
             last_hb = time.time()
-        if time.time() - LAST_CMD > int(CFG.get("afkSeconds", 180)):
+        if time.time() - LAST_CMD > int(CFG.get("afkSeconds", 180)) and READ_FAILS < 5:
+            # never afk-sleep while the inbox is unreachable - there may be a
+            # queued command we simply cannot see yet
             save_store()
             slog({"ev": "sleeping", "reason": "afk"})
             outbox_push({"ev": "sleeping", "reason": "afk", "last_done": LAST_DONE,

@@ -55,6 +55,11 @@ export interface ChatTurn {
 
 export class EngineSlot {
   readonly username: string;
+  /** Identifies THIS app run — every command carries it and the engine ignores
+   *  anything else. Stale CDN reads of old inbox versions (observed live:
+   *  Kaggle served a hours-old cmd.json as "latest") can then never poison
+   *  the engine's command cursor. */
+  readonly runId = randomUUID().slice(0, 12);
   private secret: string;
   private kaggle: Kaggle;
   private events: EventEmitter;
@@ -84,6 +89,13 @@ export class EngineSlot {
   private lastSseAt = 0;
   private recovering = false;
   private lastCmdSentAt = 0;
+  /** Version bookkeeping: lastSentCmdV = newest command we pushed;
+   *  lastSeenCmdV = newest command the engine CONFIRMED consuming (its
+   *  cmd/hb events carry v). While sent > seen, a command is still queued
+   *  in the inbox — a ping must never upload over it (snapshot semantics
+   *  would erase it — that masking ate queued chats for breakfast today). */
+  private lastSentCmdV = 0;
+  private lastSeenCmdV = 0;
   /** Highest command version sent per session — generation events tagged with
    *  a LOWER v are replays of earlier turns (the kernel log re-serves the whole
    *  session on every connect) and must never fill the current task. */
@@ -148,8 +160,8 @@ export class EngineSlot {
   /** Ensure the private relay datasets exist. Cheap (one status check each). */
   private async ensureDatasets(): Promise<void> {
     const jobs: [string, string, string][] = [
-      [`shuggle-inbox-${this.ns}`, "Shuggle Inbox", "Shuggle command relay for the Shuggle engine. Managed automatically."],
-      [`shuggle-outbox-${this.ns}`, "Shuggle Outbox", "Shuggle response relay for the Shuggle engine. Managed automatically."],
+      [`shuggle-inbox-g2-${this.ns}`, "Shuggle Inbox", "Shuggle command relay for the Shuggle engine. Managed automatically."],
+      [`shuggle-outbox-g2-${this.ns}`, "Shuggle Outbox", "Shuggle response relay for the Shuggle engine. Managed automatically."],
       [`shuggle-store-${this.ns}`, "Shuggle Store", "Shuggle engine storage for chats and memories. Managed automatically."],
     ];
     for (const [slug, title, desc] of jobs) {
@@ -226,6 +238,7 @@ export class EngineSlot {
         bearer: this.secret,
         owner: this.username,
         profile: this.profile,
+        runId: this.runId,
         contextTokens: this.contextTokens,
         afkSeconds: this.afkSeconds,
         memoryTools: this.memoryTools,
@@ -267,7 +280,7 @@ export class EngineSlot {
                 // never reported), or it died before becoming usable. The
                 // outbox tells them apart — afk-sleep always carries last_done.
                 try {
-                  const raw = await this.kaggle.datasetDownloadText(this.username, `shuggle-outbox-${this.ns}`, "state.json");
+                  const raw = await this.kaggle.datasetDownloadText(this.username, `shuggle-outbox-g2-${this.ns}`, "state.json");
                   const ob = raw ? JSON.parse(raw) : null;
                   if (ob?.ev === "sleeping" && ob?.last_done?.sid) {
                     this.awaitingFreshBoot = false;
@@ -406,7 +419,7 @@ export class EngineSlot {
       if (this.state === "sleeping" || this.state === "idle") return;
       if (this.kaggle.cooling()) return;
       try {
-        const text = await this.kaggle.datasetDownloadText(this.username, `shuggle-outbox-${this.ns}`, "state.json");
+        const text = await this.kaggle.datasetDownloadText(this.username, `shuggle-outbox-g2-${this.ns}`, "state.json");
         if (!text || text === lastOutbox) return;
         lastOutbox = text;
         // Outbox payloads prove the engine is alive just as well as log
@@ -637,8 +650,10 @@ export class EngineSlot {
         break;
       }
       case "hb":
+        if (typeof j.v === "number") this.lastSeenCmdV = Math.max(this.lastSeenCmdV, j.v);
         break;
       case "cmd":
+        if (typeof j.v === "number") this.lastSeenCmdV = Math.max(this.lastSeenCmdV, j.v);
         break;
       case "err":
         // Non-fatal engine-side error; surface quietly in logs.
@@ -656,10 +671,12 @@ export class EngineSlot {
   private async sendCmd(cmd: Record<string, any>, files: Record<string, string | Uint8Array> = {}): Promise<number> {
     cmd.v = this.nextV();
     cmd.profile = this.profile;
+    cmd.run_id = this.runId;
     const payload: Record<string, string | Uint8Array> = { "cmd.json": JSON.stringify(cmd), ...files };
     this.lastCmdSentAt = Date.now();
+    this.lastSentCmdV = cmd.v;
     console.log(`[engine ${this.username}] cmd v=${cmd.v} type=${cmd.type}${cmd.sid ? " sid=" + String(cmd.sid).slice(0, 8) : ""}`);
-    await this.kaggle.datasetUpsert(this.username, `shuggle-inbox-${this.ns}`, "Shuggle Inbox", payload, `v${cmd.v}`);
+    await this.kaggle.datasetUpsert(this.username, `shuggle-inbox-g2-${this.ns}`, "Shuggle Inbox", payload, `v${cmd.v}`);
     return cmd.v;
   }
 
@@ -743,8 +760,9 @@ export class EngineSlot {
 
   async ping(): Promise<void> {
     // Pings ride the same snapshot-semantics inbox as chat commands — a ping
-    // must never overwrite a freshly queued chat. Only ping a proven-idle
-    // engine, and never within 20s of sending a real command.
+    // must never overwrite a queued, unconsumed command. The engine confirms
+    // consumption via cmd/hb event versions; until then, hands off.
+    if (this.lastSentCmdV > this.lastSeenCmdV) return; // a command is still queued — never clobber it
     if (this.state !== "ready" && this.state !== "generating") return;
     if (Date.now() - this.lastCmdSentAt < 20_000) return;
     try {
