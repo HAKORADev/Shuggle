@@ -918,13 +918,20 @@ def extract_memory_ops(text):
         if start < 0:
             cleaned_parts.append(rest)
             break
-        end = rest.find(BT, start + len(used))
-        body = rest[start + len(used):end] if end >= 0 else rest[start + len(used):]
         cleaned_parts.append(rest[:start])
-        if end >= 0:
-            rest = rest[end + 3:]
+        after = start + len(used)
+        tail = rest[after:]
+        if tail.lstrip("\n").startswith(BT + "json"):
+            # nested fence: marker, then a json sub-fence, then two closers
+            lead = len(tail) - len(tail.lstrip("\n"))
+            off = after + lead + len(BT) + 4
+            end = rest.find(BT, off)
+            body = rest[off:end] if end >= 0 else rest[off:]
+            rest = rest[end + 3:] if end >= 0 else ""
         else:
-            rest = ""
+            end = rest.find(BT, after)
+            body = rest[after:end] if end >= 0 else rest[after:]
+            rest = rest[end + 3:] if end >= 0 else ""
         body = body.strip()
         if body.startswith("json"):
             body = body[4:].strip()
