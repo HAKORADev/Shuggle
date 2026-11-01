@@ -15,34 +15,29 @@ const lockName = "server.json";
 
 export async function connectServer(dataDir: string): Promise<Bridge> {
   const lockFile = join(dataDir, lockName);
-  // 1. try an existing server
-  if (existsSync(lockFile)) {
-    try {
-      const { port } = JSON.parse(readFileSync(lockFile, "utf8"));
-      const r = await fetch(`http://127.0.0.1:${port}/api/health`).catch(() => null);
-      if (r?.ok) {
-        const st = await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();
-        if (st.loggedIn) return { port, owned: false };
-        // running but locked — ask for the password and log in
-        const password = await promptHidden("  password: ");
-        const lr = await fetch(`http://127.0.0.1:${port}/api/login`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ password }),
-        });
-        if (!lr.ok) {
-          const j = await lr.json().catch(() => ({ error: "login failed" }));
-          throw new Error(j.error ?? "login failed");
-        }
-        return { port, owned: false };
-      }
-    } catch (e: any) {
-      if (String(e.message).includes("password")) throw e;
+  // 1. try an existing server (health-checked — stale locks are taken over)
+  const claimed = await Server.claimLock(dataDir, 0, process.pid).catch(() => null);
+  if (claimed?.existing) {
+    const port = claimed.port;
+    const st = await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();
+    if (st.loggedIn) return { port, owned: false };
+    // running but locked — ask for the password and log in
+    const password = await promptHidden("  password: ");
+    const lr = await fetch(`http://127.0.0.1:${port}/api/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+    if (!lr.ok) {
+      const j = await lr.json().catch(() => ({ error: "login failed" }));
+      throw new Error(j.error ?? "login failed");
     }
+    return { port, owned: false };
   }
-  // 2. start an embedded server
+  // 2. start an embedded server (we now hold the lock on a fresh port)
   const { pickFreePort } = await import("../launch.ts");
-  const port = await pickFreePort(8690);
+  const port = claimed ? claimed.port : await pickFreePort(8690);
+  await Server.claimLock(dataDir, port, process.pid);
   const server = new Server({
     dataDir,
     port,
@@ -53,6 +48,7 @@ export async function connectServer(dataDir: string): Promise<Bridge> {
   Bun.serve({
     port,
     hostname: "127.0.0.1",
+    idleTimeout: 255,
     fetch: (req) => server.handle(req),
   });
   server.startPings();
@@ -74,6 +70,7 @@ export async function connectServer(dataDir: string): Promise<Bridge> {
     }
   }
   writeFileSync(lockFile, JSON.stringify({ port, pid: process.pid }));
+  process.on("exit", () => Server.releaseLock(dataDir, process.pid));
   return { port, owned: true };
 }
 

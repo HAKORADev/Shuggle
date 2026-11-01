@@ -48,6 +48,15 @@ async function main(): Promise<void> {
       const isServe = cmd === "serve";
       const lan = hasFlag("--lan") || hasFlag("lan");
       const port = portFromFlags(lan ? 8680 : await pickFreePort());
+      // One data dir, one server — adopt the running one if it's alive.
+      const lock = await Server.claimLock(dataDir(), port, process.pid);
+      if (lock.existing) {
+        printBanner();
+        console.log(`\n  Shuggle is already running here:`);
+        console.log(`    http://127.0.0.1:${lock.port}\n`);
+        if (!isServe && !lan) openAppWindow(`http://127.0.0.1:${lock.port}`);
+        return;
+      }
       const server = new Server({
         dataDir: dataDir(),
         port,
@@ -59,6 +68,7 @@ async function main(): Promise<void> {
       const srv = Bun.serve({
         port,
         hostname: lan ? "0.0.0.0" : "127.0.0.1",
+        idleTimeout: 255, // long engine operations stream via SSE, but keep room
         fetch: (req) => server.handle(req),
       });
       server.startPings();
@@ -77,10 +87,12 @@ async function main(): Promise<void> {
       }
       const stop = async () => {
         await server.context.saveNow();
+        Server.releaseLock(dataDir(), process.pid);
         process.exit(0);
       };
       process.on("SIGINT", stop);
       process.on("SIGTERM", stop);
+      process.on("exit", () => Server.releaseLock(dataDir(), process.pid));
       break;
     }
     case "cli": {

@@ -195,32 +195,35 @@ def load_store():
     except Exception as e:
         err("store-load", e)
 
-def save_store(retries=2):
-    try:
-        content = json.dumps(STORE, ensure_ascii=False).encode()
-        j = rpc("blobs.BlobApiService/StartBlobUpload", {
-            "type": "DATASET", "name": "store.json",
-            "contentType": "application/octet-stream",
-            "contentLength": len(content), "lastModifiedEpochSeconds": int(time.time())})
-        req = urllib.request.Request(j["createUrl"], data=content,
-            headers={"Content-Type": "application/octet-stream"}, method="PUT")
-        with urllib.request.urlopen(req, timeout=300) as r:
-            pass
-        rpc("datasets.DatasetApiService/CreateDatasetVersion", {
-            "ownerSlug": OWNER, "datasetSlug": STORE_SLUG,
-            "body": {"files": [{"token": j["token"], "description": "", "columns": []}],
-                     "subtitle": "Shuggle store",
-                     "description": "Shuggle engine storage (sessions, memory). Managed automatically.",
-                     "categoryIds": [], "versionNotes": "t" + str(int(time.time()))}}, 300)
-        slog({"ev": "store-saved"})
-    except urllib.error.HTTPError as e:
-        if e.code == 429 and retries > 0:
-            time.sleep(45)
-            save_store(retries - 1)
-        else:
+def save_store():
+    for attempt in range(3):
+        try:
+            content = json.dumps(STORE, ensure_ascii=False).encode()
+            j = rpc("blobs.BlobApiService/StartBlobUpload", {
+                "type": "DATASET", "name": "store.json",
+                "contentType": "application/octet-stream",
+                "contentLength": len(content), "lastModifiedEpochSeconds": int(time.time())})
+            req = urllib.request.Request(j["createUrl"], data=content,
+                headers={"Content-Type": "application/octet-stream"}, method="PUT")
+            with urllib.request.urlopen(req, timeout=300) as r:
+                pass
+            rpc("datasets.DatasetApiService/CreateDatasetVersion", {
+                "ownerSlug": OWNER, "datasetSlug": STORE_SLUG,
+                "body": {"files": [{"token": j["token"], "description": "", "columns": []}],
+                         "subtitle": "Shuggle store",
+                         "description": "Shuggle engine storage (sessions, memory). Managed automatically.",
+                         "categoryIds": [], "versionNotes": "t" + str(int(time.time()))}}, 300)
+            slog({"ev": "store-saved"})
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
             err("store-save", e)
-    except Exception as e:
-        err("store-save", e)
+            return
+        except Exception as e:
+            err("store-save", e)
+            return
 
 # --------------------------------------------------------------- inbox ----
 SEEN_V = 0
@@ -228,7 +231,19 @@ SEEN_V = 0
 def read_cmd():
     global SEEN_V
     try:
-        raw = _download_bytes(OWNER, INBOX_SLUG, "cmd.json", timeout=30)
+        for _attempt in range(3):
+            try:
+                raw = _download_bytes(OWNER, INBOX_SLUG, "cmd.json", timeout=30)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and _attempt < 2:
+                    time.sleep(4)
+                    continue
+                return None
+            except Exception:
+                return None
+        else:
+            return None
         cmd = json.loads(raw.decode())
         if not isinstance(cmd, dict):
             return None
@@ -1196,15 +1211,19 @@ def main():
         vision_check_ready()
     slog({"ev": "meta", "phase": "ready"})
     LAST_CMD = time.time()
+    BOOT_GRACE_END = time.time() + 600  # wait up to 10 min for the first command
     last_hb = time.time()
+    first_cmd_seen = False
     while True:
         cmd = read_cmd()
         if cmd:
+            first_cmd_seen = True
             dispatch(cmd)
         if time.time() - last_hb > 45:
             slog({"ev": "hb"})
             last_hb = time.time()
-        if time.time() - LAST_CMD > int(CFG.get("afkSeconds", 180)):
+        threshold = int(CFG.get("afkSeconds", 180)) if first_cmd_seen else max(int(CFG.get("afkSeconds", 180)), 600)
+        if time.time() - LAST_CMD > threshold:
             save_store()
             slog({"ev": "sleeping", "reason": "afk"})
             outbox_push({"ev": "sleeping", "reason": "afk", "last_done": LAST_DONE})

@@ -44,36 +44,43 @@ export class AppContext {
   // ---- persistence -------------------------------------------------------
 
   save(domain: "sessions" | "settings" | "tokens" | "memory" | "memhist", delay = 400): void {
+    if (delay <= 0) {
+      // small critical domains (tokens, memory) flush immediately — other
+      // processes (CLI) may read the vault at any moment
+      this.flushDomain(domain);
+      return;
+    }
     const prev = this.saveTimers.get(domain);
     if (prev) clearTimeout(prev);
-    this.saveTimers.set(
-      domain,
-      setTimeout(() => {
-        this.saveTimers.delete(domain);
-        if (!this.profile) return;
-        try {
-          switch (domain) {
-            case "sessions":
-              this.profile.writeSessions(this.sessions);
-              break;
-            case "settings":
-              this.profile.writeSettings(this.settings);
-              break;
-            case "tokens":
-              this.profile.writeTokens(this.tokens);
-              break;
-            case "memory":
-              this.profile.writeMemoryText(this.memory.text);
-              break;
-            case "memhist":
-              this.profile.writeMemoryHistory(this.memory.history);
-              break;
-          }
-        } catch {
-          /* disk hiccup — retried on next change */
-        }
-      }, delay),
-    );
+    this.saveTimers.set(domain, setTimeout(() => {
+      this.saveTimers.delete(domain);
+      this.flushDomain(domain);
+    }, delay));
+  }
+
+  private flushDomain(domain: string): void {
+    if (!this.profile) return;
+    try {
+      switch (domain) {
+        case "sessions":
+          this.profile.writeSessions(this.sessions);
+          break;
+        case "settings":
+          this.profile.writeSettings(this.settings);
+          break;
+        case "tokens":
+          this.profile.writeTokens(this.tokens);
+          break;
+        case "memory":
+          this.profile.writeMemoryText(this.memory.text);
+          break;
+        case "memhist":
+          this.profile.writeMemoryHistory(this.memory.history);
+          break;
+      }
+    } catch {
+      /* disk hiccup — retried on next change */
+    }
   }
 
   saveNow(): void {
@@ -143,6 +150,7 @@ export class AppContext {
   // ---- engines -----------------------------------------------------------
 
   slotFor(username: string): EngineSlot {
+    if (process.env.SHUGGLE_DEBUG) console.error(`[app] slotFor ${username}`);
     let slot = this.slots.get(username);
     if (!slot) {
       const rec = this.tokens.tokens.find((t) => t.id === username);

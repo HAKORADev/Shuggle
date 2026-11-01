@@ -137,6 +137,10 @@ async function streamReply(userMsgId: string | null, a: ReturnType<typeof api>):
     const full = (await a.get(`/api/sessions/${session!.id}`)) as any;
     if (!full?.session) break;
     const nodes = full.session.nodes;
+    if (userMsgId && nodes[userMsgId]?.error) {
+      process.stdout.write(`\n  ! ${nodes[userMsgId].error}\n\n`);
+      break;
+    }
     const activeChild = full.session.activeChild;
     // walk to find the assistant reply after userMsgId
     const ids = walkIds(full.session);
