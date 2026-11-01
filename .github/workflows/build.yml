@@ -16,16 +16,23 @@ jobs:
       - name: Bundle UI
         run: bun build src/ui/app.ts --minify --format=iife --outfile=src/ui/app.bundle.js
       - name: Compile single binary
-        run: bun build src/shuggle.ts --compile --outfile=shuggle
+        run: bun build src/shuggle.ts --compile --minify --outfile=shuggle
       - name: Smoke test
         run: |
           ./shuggle version
           ./shuggle help | head -5
+      - name: Prepare folder (binary + launchers)
+        run: |
+          mkdir -p bundle
+          cp shuggle bundle/
+          cp launcher/shuggle.sh bundle/
+          cp launcher/shuggle-lan.sh bundle/
+          chmod +x bundle/*.sh
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Shuggle-linux-x64
-          path: shuggle
+          path: bundle/
           compression-level: 9
 
   windows:
@@ -37,9 +44,12 @@ jobs:
           bun-version: latest
       - name: Bundle UI
         run: bun build src/ui/app.ts --minify --format=iife --outfile=src/ui/app.bundle.js
+      # Console subsystem on purpose: the CLI modes (cli / chat / tokens) print to
+      # the terminal. In window mode the app detaches its console at runtime
+      # (FreeConsole), so there is no black cmd box behind the window.
       - name: Compile single binary
         shell: bash
-        run: bun build src/shuggle.ts --compile --windows-icon=assets/shuggle.ico --windows-hide-console --windows-title="Shuggle" --windows-publisher="HAKORA" --windows-version="0.5.0.0" --windows-description="Free chats on free GPUs" --outfile=Shuggle.exe
+        run: bun build src/shuggle.ts --compile --minify --windows-icon=assets/shuggle.ico --windows-title="Shuggle" --windows-publisher="HAKORA" --windows-version="0.5.0.0" --windows-description="Free chats on free GPUs" --outfile=Shuggle.exe
       - name: Smoke test
         shell: bash
         run: |
@@ -51,9 +61,9 @@ jobs:
           mkdir -p bundle
           cp Shuggle.exe bundle/
           cp launcher/"Shuggle.bat" bundle/
+          cp launcher/"Shuggle CLI.bat" bundle/
+          cp launcher/"Shuggle Ask.bat" bundle/
           cp launcher/"Shuggle LAN.bat" bundle/
-          cp launcher/shuggle.sh bundle/
-          cp launcher/shuggle-lan.sh bundle/
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

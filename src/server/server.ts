@@ -769,7 +769,9 @@ export class Server {
         text,
         startedAt: Date.now(),
         chunks: { think: "", text: "" },
-        slot: slot.username,
+        // The engine slot is only known once ensureEngine() answers — the
+        // background task below fills it in.
+        slot: s.engineUsername ?? "",
       };
       this.tasks.set(s.id, task);
       this.broadcast("session", { sid: s.id, reason: "user-added", msgId: userNode.id });
@@ -845,7 +847,9 @@ export class Server {
         text: userNode.content,
         startedAt: Date.now(),
         chunks: { think: "", text: "" },
-        slot: slot.username,
+        // The engine slot is only known once ensureEngine() answers — the
+        // background task below fills it in.
+        slot: s.engineUsername ?? "",
       };
       this.tasks.set(s.id, task);
       this.broadcast("session", { sid: s.id, reason: "retry", userMsgId });
@@ -930,7 +934,9 @@ export class Server {
         text,
         startedAt: Date.now(),
         chunks: { think: "", text: "" },
-        slot: slot.username,
+        // The engine slot is only known once ensureEngine() answers — the
+        // background task below fills it in.
+        slot: s.engineUsername ?? "",
       };
       this.tasks.set(s.id, task);
 
