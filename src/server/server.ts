@@ -1036,7 +1036,7 @@ export class Server {
   // ===================================================================
 
   private static(path: string): Response {
-    const { indexHtml, styleCss, appJs, markedJs, purifyJs, hljsJs, hljsCss, faviconPng } = assets;
+    const { indexHtml, styleCss, appJs, markedJs, purifyJs, hljsJs, hljsCss, faviconSvg } = assets;
     let body = "";
     let type = "text/html; charset=utf-8";
     switch (path) {
@@ -1068,8 +1068,8 @@ export class Server {
         body = hljsCss;
         type = "text/css; charset=utf-8";
         break;
-      case "/favicon.png":
-        return new Response(faviconPng, { headers: { "Content-Type": "image/png" } });
+      case "/favicon.svg":
+        return new Response(faviconSvg, { headers: { "Content-Type": "image/svg+xml" } });
       default:
         body = indexHtml;
     }
@@ -1174,25 +1174,8 @@ function engineEntriesBefore(path: Msg[], uptoId: string): { role: string; conte
   return engineEntries(path.slice(0, idx));
 }
 
-// assets — embedded at build time (populated by build script; dev mode reads from disk)
-import { readFileSync, existsSync } from "node:fs";
-const devRoot = new URL("../../", import.meta.url).pathname;
-function readAsset(rel: string, binary = false): any {
-  const p = join(devRoot, rel);
-  if (existsSync(p)) {
-    return binary ? readFileSync(p) : readFileSync(p, "utf8");
-  }
-  return binary ? new Uint8Array() : "";
-}
-const _uiDir = "src/ui";
-const _vendor = "src/ui/vendor";
-export const assets = {
-  indexHtml: readAsset(`${_uiDir}/index.html`),
-  styleCss: readAsset(`${_uiDir}/style.css`),
-  appJs: readAsset(`${_uiDir}/app.bundle.js`),
-  markedJs: readAsset(`${_vendor}/marked.min.js`),
-  purifyJs: readAsset(`${_vendor}/purify.min.js`),
-  hljsJs: readAsset(`${_vendor}/highlight.min.js`),
-  hljsCss: readAsset(`${_vendor}/highlight-theme.css`),
-  faviconPng: readAsset("assets/shuggle_32.png", true),
-};
+// The UI assets are compiled INTO the binary (see src/ui/assets.ts). Reading
+// them from disk instead leaves the shipped single-file app with a blank
+// window, because there is no src/ui folder next to the executable.
+import { assets } from "../ui/assets.ts";
+export { assets };

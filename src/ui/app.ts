@@ -1470,6 +1470,24 @@ function openMemory(): void {
 
 // per-chat settings (override)
 
+/** The skills offered for one chat: everything globally on, minus the ones
+ *  this chat excludes. Skills that are off globally are listed as such. */
+function skillPickerHtml(disabledIds: string[]): string {
+  const list = (app.settings.skills ?? []) as any[];
+  if (!list.length) return '<div class="empty-note">No skills yet — create them in Settings → Skills.</div>';
+  const off = new Set(disabledIds);
+  return list
+    .map((sk) => {
+      const excluded = off.has(sk.id);
+      const state = sk.enabled ? (excluded ? "off for this chat" : "on in this chat") : "off everywhere";
+      return `<label class="skill-pick-row">
+        <input type="checkbox" data-skill-id="${esc(sk.id)}" ${sk.enabled && !excluded ? "checked" : ""} ${sk.enabled ? "" : "disabled"}/>
+        <span class="sp-text"><b>${esc(sk.title)}</b><i>${esc(state)}</i></span>
+      </label>`;
+    })
+    .join("");
+}
+
 function openChatSettings(): void {
   const meta = app.currentMeta;
   const full = app.current;
@@ -1490,6 +1508,12 @@ function openChatSettings(): void {
         <option value="on" ${o.skillsEnabled === true ? "selected" : ""}>Always on here</option>
         <option value="off" ${o.skillsEnabled === false ? "selected" : ""}>Always off here</option>
       </select>
+    </div>
+    <div class="setting-row"><label class="main">Which skills apply here</label>
+      <div class="desc">Uncheck a skill to keep it out of this conversation only. It stays on everywhere else.</div>
+      <div id="cs-skill-list" class="skill-picker">
+        ${skillPickerHtml(o.disabledSkillIds ?? [])}
+      </div>
     </div>
     <div class="setting-row"><label class="main">Reply language for this chat</label>
       <div class="desc">Overrides your global language choice, just for this conversation.</div>
@@ -1523,11 +1547,16 @@ function openChatSettings(): void {
           const sk = ($("#cs-skills") as HTMLSelectElement).value;
           const lm = ($("#cs-lang") as HTMLSelectElement).value;
           const lc = ($("#cs-langcode") as HTMLSelectElement).value;
+          const disabledSkillIds: string[] = [];
+          document.querySelectorAll<HTMLInputElement>("#cs-skill-list input[data-skill-id]").forEach((el) => {
+            if (!el.checked && !el.disabled) disabledSkillIds.push(el.dataset.skillId!);
+          });
           await api("PATCH", `/api/sessions/${meta.id}`, {
             override: {
               systemPrompt: sys || undefined,
               temperature: temp,
               skillsEnabled: sk === "inherit" ? undefined : sk === "on",
+              disabledSkillIds,
               languageMode: lm === "inherit" ? undefined : (lm as any),
               languageCode: lm === "manual" ? lc : undefined,
             },

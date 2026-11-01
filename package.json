@@ -1,4 +1,17 @@
 {
+  "name": "shuggle",
+  "version": "0.5.0",
+  "private": true,
+  "description": "Free unlimited AI chatting on Kaggle GPU hours — uncensored 27B on T4 x2, multi-token rotation, one-file app, branching chats, memory, skills, vision, web search.",
+  "scripts": {
+    "build:ui": "bun build src/ui/app.ts --minify --format=iife --outfile=src/ui/app.bundle.js",
+    "build": "bun run build:ui && bun build src/shuggle.ts --compile --minify --outfile=shuggle",
+    "dev": "bun run build:ui && bun src/shuggle.ts",
+    "start": "bun src/shuggle.ts",
+    "test": "bun test tests/core.test.ts",
+    "test:ui": "bun run build:ui && bun tests/ui.test.ts",
+    "typecheck": "bunx tsc --noEmit --allowImportingTsExtensions --module esnext --moduleResolution bundler --target esnext --lib esnext,dom --skipLibCheck src/shuggle.ts"
+  },
   "dependencies": {},
   "devDependencies": {
     "@types/bun": "^1.4.4"
