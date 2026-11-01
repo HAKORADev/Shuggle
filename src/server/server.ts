@@ -9,6 +9,7 @@ import { mergeOverride } from "../core/settings.ts";
 import { activeSkills, skillsPrompt } from "../core/skills.ts";
 import { poolAdd, poolRefresh, poolSummary, poolAutoPick } from "../core/tokens.ts";
 import { hsh16 } from "../core/util.ts";
+import type { ChatTurn } from "../core/engine.ts";
 
 interface ChatTask {
   sid: string;
@@ -19,6 +20,8 @@ interface ChatTask {
   startedAt: number;
   chunks: { think: string; text: string };
   slot: string; // engine username this turn was sent to
+  turn?: ChatTurn; // the exact request sent — replayed after a history resync
+  resends?: number;
 }
 
 interface IncomingMedia {
@@ -124,12 +127,14 @@ export class Server {
         break;
       }
       case "resync": {
-        // The engine's history diverged — push the active path fully.
+        // The engine's history diverged — push the active path fully, then
+        // RE-ISSUE the pending generation request (the original command was
+        // consumed by the resync; without this the reply never happens).
         const task = this.taskFor(ev.sid);
-        if (!task) break;
-        const s = this.app.sessions.sessions[task.sid];
+        const s = this.app.sessions.sessions[ev.sid];
         if (!s) break;
-        void this.pushFullPath(ev.slot, s);
+        if (task?.turn && (task.resends ?? 0) < 2) void this.resyncAndResend(ev.slot, s, task);
+        else void this.pushFullPath(ev.slot, s);
         break;
       }
       case "probe":
@@ -252,6 +257,25 @@ export class Server {
       await slot.resyncPath(s.id, entries);
     } catch {
       /* retried on next divergence */
+    }
+  }
+
+  /** After a history divergence: sync the full path to the engine, then send
+   *  the pending turn again (empty delta — the full path already carries it). */
+  private async resyncAndResend(slotUsername: string, s: SessionData, task: ChatTask): Promise<void> {
+    try {
+      const slot = this.app.slots.get(slotUsername);
+      if (!slot || !task.turn) return;
+      if ((task.resends ?? 0) >= 2) return; // never loop
+      const path = activePath(s);
+      const entries = engineEntries(path);
+      await slot.resyncPath(s.id, entries);
+      task.resends = (task.resends ?? 0) + 1;
+      const turn: ChatTurn = { ...task.turn, uptoHash: hsh16(entries), newMsgs: [], truncateMid: null, truncateAfterMid: null };
+      await slot.wakeAndSend(turn);
+      task.turn = turn;
+    } catch {
+      /* the failed-message path handles it from here */
     }
   }
 
@@ -721,9 +745,7 @@ export class Server {
         chunks: { think: "", text: "" },
         slot: slot.username,
       };
-      this.tasks.set(s.id, task);
-
-      await slot.wakeAndSend({
+      const turn: ChatTurn = {
         sid: s.id,
         uptoHash,
         newMsgs: [{ role: "user", content: full, mid: userNode.id }],
@@ -736,7 +758,11 @@ export class Server {
         skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
         media: mediaFiles.length ? mediaFiles.map((m) => ({ name: m.name, kind: m.kind, file: m.file, bytes: m.bytes })) : undefined,
         mediaForMid: mediaFiles.length ? userNode.id : null,
-      });
+      };
+      task.turn = turn;
+      this.tasks.set(s.id, task);
+
+      await slot.wakeAndSend(turn);
 
       this.broadcast("session", { sid: s.id, reason: "user-added", msgId: userNode.id });
       return this.json({ ok: true, userMsgId: userNode.id });
@@ -784,9 +810,7 @@ export class Server {
         chunks: { think: "", text: "" },
         slot: slot.username,
       };
-      this.tasks.set(s.id, task);
-
-      await slot.wakeAndSend({
+      const turn: ChatTurn = {
         sid: s.id,
         uptoHash,
         truncateAfterMid: userMsgId,
@@ -798,7 +822,11 @@ export class Server {
         memoryText: s.memoryEnabled ? this.app.memory.text : null,
         thinking: s.thinkingEnabled,
         skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
-      });
+      };
+      task.turn = turn;
+      this.tasks.set(s.id, task);
+
+      await slot.wakeAndSend(turn);
 
       this.broadcast("session", { sid: s.id, reason: "retry", userMsgId });
       return this.json({ ok: true });
@@ -861,9 +889,7 @@ export class Server {
         chunks: { think: "", text: "" },
         slot: slot.username,
       };
-      this.tasks.set(s.id, task);
-
-      await slot.wakeAndSend({
+      const turn: ChatTurn = {
         sid: s.id,
         uptoHash,
         truncateMid: old.id,
@@ -875,7 +901,11 @@ export class Server {
         memoryText: s.memoryEnabled ? this.app.memory.text : null,
         thinking: s.thinkingEnabled,
         skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
-      });
+      };
+      task.turn = turn;
+      this.tasks.set(s.id, task);
+
+      await slot.wakeAndSend(turn);
 
       this.persist("sessions");
       this.broadcast("session", { sid: s.id, reason: "edited", msgId: node.id });
