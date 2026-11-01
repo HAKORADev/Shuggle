@@ -71,6 +71,16 @@ export async function runOneLine(opts: { dataDir: string; args: string[] }): Pro
       .slice(uIdx + 1)
       .map((id: string) => sess.nodes[id])
       .find((n: any) => n?.role === "assistant");
+    // The failure lands on the ASSISTANT node — check that one too, or a
+    // failed turn looks like a hang.
+    const failedNode = ids
+      .slice(uIdx + 1)
+      .map((id: string) => sess.nodes[id])
+      .find((n: any) => n?.error);
+    if (failedNode?.error) {
+      console.error(`  ${failedNode.error}`);
+      process.exit(1);
+    }
     if (!assistant) continue;
     const think = assistant.thinking ?? "";
     const body = assistant.content ?? "";

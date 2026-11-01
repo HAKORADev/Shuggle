@@ -112,10 +112,25 @@ export class Server {
             }
           }
         }
-        // If the engine died while tasks were pending, fail them honestly.
+        // The engine went away while a reply was pending. If it merely fell
+        // asleep (or hiccuped), wake it again and let it pick the queued
+        // command back up — the command is already in the inbox. Only give up
+        // after a couple of attempts, and say so honestly when we do.
         if (ev.state === "error" || ev.state === "sleeping") {
           for (const [sid, task] of [...this.tasks.entries()]) {
             if (task.slot !== slot) continue;
+            const tries = ((task as any).wakeTries ?? 0) + 1;
+            (task as any).wakeTries = tries;
+            if (tries <= 2 && task.turn) {
+              const slotObj = this.app.slots.get(slot);
+              if (slotObj) {
+                void slotObj
+                  .wakeAndSend(task.turn)
+                  .catch(() => slotObj.boot({ id: slot, secret: this.app.tokens.tokens.find((t) => t.id === slot)?.secret } as any))
+                  .catch(() => {});
+                continue; // keep the task alive — the engine is coming back
+              }
+            }
             this.tasks.delete(sid);
             const s = this.app.sessions.sessions[sid];
             if (s && task.assistantMsgId && s.nodes[task.assistantMsgId]) {
