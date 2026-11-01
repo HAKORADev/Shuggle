@@ -7,7 +7,7 @@ import { AppContext } from "../core/app.ts";
 import { newSession, activePath, addNode, renameAuto, switchDimension, branchOut, Msg, SessionData, childrenOf } from "../core/sessions.ts";
 import { buildSystemPrompt } from "../core/sysprompt.ts";
 import { mergeOverride } from "../core/settings.ts";
-import { activeSkills, skillsPrompt } from "../core/skills.ts";
+import { activeSkills } from "../core/skills.ts";
 import { poolAdd, poolRefresh, poolSummary, poolAutoPick } from "../core/tokens.ts";
 import { hsh16 } from "../core/util.ts";
 
@@ -438,14 +438,16 @@ export class Server {
       const b = await req.json().catch(() => ({}));
       const prevAfk = this.app.settings.afkMinutes;
       const prevVision = JSON.stringify(this.app.settings.vision);
+      const prevMemTools = !!this.app.settings.memoryTools;
       this.app.settings = mergeUser(this.app.settings, b);
       // Clamp skills through the settings module for safety.
       this.app.settings = { ...this.app.settings, skills: this.app.settings.skills ?? [] };
       this.persist("settings");
-      if (this.app.settings.afkMinutes !== prevAfk || JSON.stringify(this.app.settings.vision) !== prevVision) {
+      if (this.app.settings.afkMinutes !== prevAfk || JSON.stringify(this.app.settings.vision) !== prevVision || !!this.app.settings.memoryTools !== prevMemTools) {
         for (const slot of this.app.slots.values()) {
           void slot.configure({
             afkSeconds: this.app.settings.afkMinutes * 60,
+            memoryTools: !!this.app.settings.memoryTools,
             vision: {
               enabled: this.app.settings.vision.enabled,
               maxFrames: this.app.settings.vision.maxFrames,
@@ -769,7 +771,7 @@ export class Server {
         text,
         startedAt: Date.now(),
         chunks: { think: "", text: "" },
-        slot: slot.username,
+        slot: "",
       };
       this.tasks.set(s.id, task);
       this.broadcast("session", { sid: s.id, reason: "user-added", msgId: userNode.id });
@@ -845,7 +847,7 @@ export class Server {
         text: userNode.content,
         startedAt: Date.now(),
         chunks: { think: "", text: "" },
-        slot: slot.username,
+        slot: "",
       };
       this.tasks.set(s.id, task);
       this.broadcast("session", { sid: s.id, reason: "retry", userMsgId });
@@ -930,7 +932,7 @@ export class Server {
         text,
         startedAt: Date.now(),
         chunks: { think: "", text: "" },
-        slot: slot.username,
+        slot: "",
       };
       this.tasks.set(s.id, task);
 

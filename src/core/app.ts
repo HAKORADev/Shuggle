@@ -161,6 +161,13 @@ export class AppContext {
         profile: this.profile?.name ?? "default",
         contextTokens: this.settings.contextTokens,
         afkSeconds: this.settings.afkMinutes * 60,
+        memoryTools: !!this.settings.memoryTools,
+        vision: {
+          enabled: !!this.settings.vision.enabled,
+          maxFrames: this.settings.vision.maxFrames,
+          frameSeconds: this.settings.vision.frameSeconds,
+          mediaTokenBudget: this.settings.mediaTokenBudget,
+        },
         events: this.events,
       });
       this.slots.set(username, slot);

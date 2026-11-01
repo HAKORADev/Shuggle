@@ -25,6 +25,8 @@ export interface EngineConfig {
   profile: string;
   contextTokens: number;
   afkSeconds: number;
+  memoryTools: boolean;
+  vision: { enabled: boolean; maxFrames: number; frameSeconds: number; mediaTokenBudget: number };
 }
 
 interface CmdChat {
@@ -70,6 +72,12 @@ import urllib.parse
 import urllib.request
 
 CFG = json.loads(r'''__CONFIG__''')
+if isinstance(CFG.get("vision"), dict):
+    _v = CFG["vision"]
+    CFG["visionEnabled"] = bool(_v.get("enabled", False))
+    CFG["visionMaxFrames"] = int(_v.get("maxFrames", 8))
+    CFG["visionFrameSeconds"] = int(_v.get("frameSeconds", 2))
+    CFG["mediaBudget"] = int(_v.get("mediaTokenBudget", 8000))
 BASE = "https://www.kaggle.com/api/v1"
 OWNER = CFG["owner"]
 PROFILE = CFG["profile"]
@@ -1152,6 +1160,8 @@ def handle_config(cmd):
     patch = cmd.get("patch", {})
     if "afkSeconds" in patch:
         CFG["afkSeconds"] = max(60, int(patch["afkSeconds"]))
+    if "memoryTools" in patch:
+        CFG["memoryTools"] = bool(patch["memoryTools"])
     if "vision" in patch:
         v = patch["vision"] or {}
         CFG["visionEnabled"] = bool(v.get("enabled", False))
@@ -1162,7 +1172,7 @@ def handle_config(cmd):
             vision_unload()
         else:
             VISION["failed"] = None
-    slog({"ev": "config", "patch": {k: CFG.get(k) for k in ("afkSeconds", "visionEnabled", "visionMaxFrames", "visionFrameSeconds", "mediaBudget")}})
+    slog({"ev": "config", "patch": {k: CFG.get(k) for k in ("afkSeconds", "memoryTools", "visionEnabled", "visionMaxFrames", "visionFrameSeconds", "mediaBudget")}})
 
 def dispatch(cmd):
     global SEEN_V, LAST_CMD, LAST_DONE
@@ -1211,7 +1221,6 @@ def main():
         vision_check_ready()
     slog({"ev": "meta", "phase": "ready"})
     LAST_CMD = time.time()
-    BOOT_GRACE_END = time.time() + 600  # wait up to 10 min for the first command
     last_hb = time.time()
     first_cmd_seen = False
     while True:
@@ -1220,7 +1229,9 @@ def main():
             first_cmd_seen = True
             dispatch(cmd)
         if time.time() - last_hb > 45:
-            slog({"ev": "hb"})
+            # timestamp makes every heartbeat unique — the app dedupes exact
+            # repeats, and a deduped heartbeat would look like silence
+            slog({"ev": "hb", "t": int(time.time())})
             last_hb = time.time()
         threshold = int(CFG.get("afkSeconds", 180)) if first_cmd_seen else max(int(CFG.get("afkSeconds", 180)), 600)
         if time.time() - LAST_CMD > threshold:

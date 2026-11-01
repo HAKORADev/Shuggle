@@ -14,6 +14,13 @@ import { hsh16 } from "./util.ts";
 import { TokenRecord } from "./tokens.ts";
 import { EventEmitter } from "node:events";
 
+export interface EngineVisionConfig {
+  enabled: boolean;
+  maxFrames: number;
+  frameSeconds: number;
+  mediaTokenBudget: number;
+}
+
 export type SlotState = "idle" | "seeding" | "booting" | "waking" | "ready" | "generating" | "sleeping" | "error";
 export type VisionState = "unknown" | "ready" | "unavailable" | "off";
 
@@ -72,6 +79,8 @@ export class EngineSlot {
   private slug: string;
   private contextTokens: number;
   private afkSeconds: number;
+  private memoryTools: boolean;
+  private vision: EngineVisionConfig;
   private seenSessionHash: Record<string, string> = {};
   private memHash: string = "";
   private probe: { chars_per_token: Record<string, number>; ctx: number } | null = null;
@@ -90,7 +99,7 @@ export class EngineSlot {
    *  (replays land instantly; a fresh session takes minutes to start). */
   private awaitingFreshBoot = false;
 
-  constructor(opts: { username: string; secret: string; profile: string; contextTokens: number; afkSeconds: number; events: EventEmitter }) {
+  constructor(opts: { username: string; secret: string; profile: string; contextTokens: number; afkSeconds: number; memoryTools: boolean; vision: EngineVisionConfig; events: EventEmitter }) {
     this.username = opts.username;
     this.secret = opts.secret;
     this.profile = opts.profile;
@@ -98,6 +107,8 @@ export class EngineSlot {
     this.slug = `shuggle-engine-${this.ns}`;
     this.contextTokens = opts.contextTokens;
     this.afkSeconds = opts.afkSeconds;
+    this.memoryTools = opts.memoryTools;
+    this.vision = opts.vision;
     this.events = opts.events;
     this.kaggle = new Kaggle(opts.secret);
   }
@@ -249,6 +260,8 @@ export class EngineSlot {
       profile: this.profile,
       contextTokens: this.contextTokens,
       afkSeconds: this.afkSeconds,
+      memoryTools: this.memoryTools,
+      vision: this.vision,
     });
     dbg("boot: pushing engine kernel");
     const res = await this.kaggle.pushKernel({
@@ -716,7 +729,10 @@ export class EngineSlot {
   }
 
   /** Live engine configuration — applied on the next loop tick, NO restart. */
-  async configure(patch: { afkSeconds?: number; vision?: { enabled: boolean; maxFrames?: number; frameSeconds?: number; mediaTokenBudget?: number } }): Promise<void> {
+  async configure(patch: { afkSeconds?: number; memoryTools?: boolean; vision?: { enabled: boolean; maxFrames?: number; frameSeconds?: number; mediaTokenBudget?: number } }): Promise<void> {
+    // remember engine-affecting settings so a later boot bakes them in
+    if (patch.memoryTools !== undefined) this.memoryTools = patch.memoryTools;
+    if (patch.vision) this.vision = { ...this.vision, ...patch.vision };
     if (this.state === "idle" || this.state === "sleeping" || this.state === "error") return; // applied at boot
     await this.sendCmd({ type: "config", patch }).catch(() => {});
   }

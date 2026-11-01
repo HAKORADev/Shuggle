@@ -9,6 +9,11 @@
 //   shuggle help         → this list
 //
 // argv dispatch happens FIRST — nothing else runs before it.
+//
+// Windows console model: the exe is compiled as a CONSOLE-subsystem binary
+// (so `shuggle cli` from cmd/PowerShell works with real stdio), and GUI mode
+// hides its console window at startup (no black box behind the app window).
+// Console verbs (cli/chat/tokens/status/help/version) keep the console.
 
 import { join, dirname } from "node:path";
 import { VERSION } from "./version.ts";
@@ -28,8 +33,43 @@ function dataDir(): string {
   // Next to the executable, like every HAKORA tool: one folder, everything inside.
   const invoked = process.argv[1] ?? "";
   const devMode = invoked.endsWith(".ts") || invoked.endsWith(".js");
-  if (devMode) return join(process.cwd(), "ShuggleData");
-  return join(dirname(process.execPath), "ShuggleData");
+  return devMode ? join(process.cwd(), "ShuggleData") : join(dirname(process.execPath), "ShuggleData");
+}
+
+/** Hide the console window this process inherited (Windows, GUI mode only).
+ *  The exe stays console-subsystem so terminal commands keep real stdio. */
+function hideWindowsConsole(): void {
+  if (process.platform !== "win32") return;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { dlopen, suffix } = require("bun:ffi");
+    const lib = dlopen(`kernel32.${suffix}`, {
+      GetConsoleWindow: { args: [], returns: "ptr" },
+      ShowWindow: { args: ["ptr", "i32"], returns: "i32" },
+      FreeConsole: { args: [], returns: "i32" },
+    });
+    const hwnd = lib.symbols.GetConsoleWindow();
+    if (hwnd) {
+      lib.symbols.ShowWindow(hwnd, 0); // SW_HIDE
+      lib.symbols.FreeConsole(); // release the caller's shell
+    }
+  } catch {
+    /* worst case the console stays visible — never worth crashing over */
+  }
+}
+
+function crashLog(e: unknown): void {
+  try {
+    const dir = dataDir();
+    const fs = require("node:fs");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = join(dir, "last-error.txt");
+    const stamp = new Date().toISOString();
+    fs.appendFileSync(file, `[${stamp}] Shuggle failed to start:\n${e?.stack ?? String(e)}\n\n`);
+    console.error(`\n  Shuggle hit a problem starting up. Details written to:\n  ${file}\n`);
+  } catch {
+    console.error(e);
+  }
 }
 
 function portFromFlags(defaultPort: number): number {
@@ -47,6 +87,9 @@ async function main(): Promise<void> {
     case "serve": {
       const isServe = cmd === "serve";
       const lan = hasFlag("--lan") || hasFlag("lan");
+      // Hide the inherited console only for the windowed app experience.
+      // `serve`/LAN mode keeps it — the user is reading URLs from it.
+      if (!isServe && !lan) hideWindowsConsole();
       const port = portFromFlags(lan ? 8680 : await pickFreePort());
       // One data dir, one server — adopt the running one if it's alive.
       const lock = await Server.claimLock(dataDir(), port, process.pid);
@@ -151,6 +194,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  console.error(e?.message ?? e);
+  crashLog(e);
   process.exit(1);
 });

@@ -131,14 +131,17 @@ export function sanitizeSkills(list: unknown): Skill[] {
   return out;
 }
 
-/** The skills enabled for a given chat: global list filtered by the session's choices. */
+/** The skills enabled for a given chat: global list filtered by the session's choices.
+ *  Session semantics: undefined = follow the global master switch; false = force off;
+ *  true = force on for this chat even when skills are globally off. */
 export function activeSkills(
   skills: Skill[],
   masterEnabled: boolean,
   sessionEnabled?: boolean,
   disabledIds?: string[],
 ): Skill[] {
-  if (!masterEnabled || sessionEnabled === false) return [];
+  if (sessionEnabled === false) return [];
+  if (!masterEnabled && sessionEnabled !== true) return [];
   const off = new Set(disabledIds ?? []);
   return skills.filter((s) => s.enabled && !off.has(s.id) && s.content.trim());
 }
