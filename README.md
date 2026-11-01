@@ -58,7 +58,9 @@ Shuggle sets up one private engine on **your** Kaggle account: it mounts the mod
 - **Real chat interface** — markdown, syntax-highlighted code with copy/download, RTL and Arabic done right, thinking blocks you can show or hide, reply timings, streaming as it writes.
 - **Branching that makes sense** — retry an older message and it opens a **new dimension** instead of shredding your chat. Flip between dimensions with `‹ 2/3 ›`. Edit any of your messages to re-send with changes. Branch any point out into a fresh chat carrying the full context.
 - **Web search, engineered not vibes** — an on/off toggle per chat. The model plans a few queries, reads unfiltered results, a distillation pass compresses them into exactly what the question needs. Capped and configurable. A fixed pipeline, never an agent.
-- **Memory** — one text you maintain (or let the model maintain, optionally), shared across every chat, toggleable per chat, capped at 10K characters.
+- **Skills** — playbooks you write once: a title, when it applies, why it exists, and the instructions. The model follows the ones that match the message and ignores the rest. Toggle the whole system, a single skill, or any skill for a single chat — globally and per chat.
+- **It can see** — images and video, through the model's own vision projector. It loads the moment you send something visual and unloads when you switch it off; no restart, ever. Hard caps on size, count and frames, and a context budget so a long clip can never swallow the conversation.
+- **Memory** — one text you maintain (or let the model maintain, optionally), shared across every chat, toggleable per chat, capped at 10K characters. The model gets create / edit / delete / list / list-deleted / undo — with undo that really works — and its own instructions, separate from your prompt.
 - **Attachments** — UTF-8 text files ride inside the message as attachment chips. Over the limit? Refused with a clear message. Never silently clipped.
 - **Dual-chat compare** — run two chats side by side, broadcast one message to both or talk to each separately. Perfect for comparing prompts, temperatures, or your own branches.
 - **Terminal at your side (CLI)** — `shuggle cli` is a real conversation in your terminal with the same account, same history, same memories. `shuggle chat "..."` for one-shot asks.
@@ -74,9 +76,12 @@ shuggle chat "text"        ask once, get the answer
 shuggle chat 2 "text"      ask in chat #2
 shuggle tokens add <tok>   add a Kaggle token
 shuggle tokens list        pool status
+shuggle account            create this device's account
 shuggle status             engines at a glance
 shuggle serve --lan        share on your local network
 ```
+
+Launchers do the same thing without typing: `Shuggle.bat`, `Shuggle CLI.bat`, `Shuggle Ask.bat`, `Shuggle LAN.bat` (Windows) and `shuggle.sh` / `shuggle-lan.sh` (Linux).
 
 Interactive commands: `/new /open /list /rename /del /pin /search /think /memory /tokens /use /status /sleep /help`
 
@@ -91,6 +96,8 @@ Run **`Shuggle LAN.bat`** (Windows) or **`./shuggle-lan.sh`** (Linux) — Shuggl
 **Where does my data live?** In `ShuggleData/` next to the executable, encrypted with your password. The engine keeps its working notes in your own private Kaggle storage so boots are fast — that storage is bound to your token and readable only by your account.
 
 **Why does the first message take a while?** The engine is being set up on your Kaggle account (model stored once, ~15 minutes). After that, waking the engine takes a few minutes, and replies start streaming right after.
+
+**Does it need a restart when I change something?** No. Prompts, memories, skills, the reply language, vision and the rest timer all apply to the next message — live. The only thing that needs the engine to come back up is the context size, and the app does that for you with one button.
 
 **What does "resting" mean?** The engine saved everything and gave its GPU hours back. It wakes automatically on your next message — chats, memories and context come back exactly as they were.
 

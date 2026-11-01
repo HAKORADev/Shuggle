@@ -194,8 +194,21 @@ def hsh(obj):
 STORE = {"sessions": {}, "memory": {"text": "", "hash": "", "deleted": [], "log": []}}
 
 def load_store():
+    raw = None
+    for attempt in range(4):
+        try:
+            raw = _download_bytes(OWNER, STORE_SLUG, "store.json")
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 3:
+                time.sleep(4 * (attempt + 1))
+                continue
+            err("store-load", e)
+            return
+        except Exception as e:
+            err("store-load", e)
+            return
     try:
-        raw = _download_bytes(OWNER, STORE_SLUG, "store.json")
         data = json.loads(raw.decode())
         if isinstance(data, dict):
             STORE["sessions"] = data.get("sessions", {})
