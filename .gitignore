@@ -8,3 +8,6 @@ shuggle
 ShuggleData/
 app.bundle.js
 build/ui-test.png
+
+# NFS temp files (the sandbox writes the compiled binary through these)
+.nfs*
