@@ -1502,7 +1502,7 @@ function openChatSettings(): void {
       <div class="range-row"><input type="range" id="cs-temp" min="0" max="2" step="0.05" value="${o.temperature ?? app.settings.temperature}"/><span class="range-val" id="cs-temp-val">${o.temperature ?? app.settings.temperature}</span></div>
     </div>
     <div class="setting-row"><label class="main">Skills in this chat</label>
-      <div class="desc">Gates all skills for this conversation — the global switch and each skill's own toggle still apply everywhere else.</div>
+      <div class="desc">"Always on here" works even when skills are globally off — this chat only. "Always off here" silences them for this conversation; every other chat follows the global switch.</div>
       <select id="cs-skills">
         <option value="inherit" ${o.skillsEnabled === undefined ? "selected" : ""}>Follow the global switch</option>
         <option value="on" ${o.skillsEnabled === true ? "selected" : ""}>Always on here</option>

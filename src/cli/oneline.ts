@@ -112,7 +112,13 @@ export async function runStatus(opts: { dataDir: string }): Promise<void> {
   try {
     bridge = await connectServer(opts.dataDir);
   } catch (e: any) {
-    console.error(`  ${e.message}`);
+    const msg = String(e?.message ?? e);
+    // "No account yet" is a healthy state for a status glance, not a failure.
+    if (/no account/i.test(msg)) {
+      console.log(`\n  ${msg}\n  Chats: 0\n`);
+      process.exit(0);
+    }
+    console.error(`  ${msg}`);
     process.exit(1);
   }
   const a = api(bridge.port);

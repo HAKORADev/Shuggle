@@ -33,7 +33,9 @@ export function languageDirective(mode: "auto" | "device" | "manual", code: stri
   if (mode === "device") {
     let lang = "English";
     try {
-      const loc = new Intl.Locale((typeof navigator !== "undefined" ? navigator.language : "en"));
+      // Server-side (the compiled exe) — navigator doesn't exist here, use Intl.
+      const raw = (typeof navigator !== "undefined" && navigator.language) || Intl.DateTimeFormat().resolvedOptions().locale || "en";
+      const loc = new Intl.Locale(raw);
       const c = (loc.language || "en").toLowerCase();
       lang = LANGUAGE_NAMES[c] ?? loc.language ?? "English";
     } catch {

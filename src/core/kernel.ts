@@ -28,6 +28,8 @@ export interface EngineConfig {
   ns: string;
   contextTokens: number;
   afkSeconds: number;
+  memoryTools: boolean;
+  vision: { enabled: boolean; maxFrames: number; frameSeconds: number; mediaTokenBudget: number };
 }
 
 interface CmdChat {
@@ -73,6 +75,12 @@ import urllib.parse
 import urllib.request
 
 CFG = json.loads(r'''__CONFIG__''')
+if isinstance(CFG.get("vision"), dict):
+    _v = CFG["vision"]
+    CFG["visionEnabled"] = bool(_v.get("enabled", False))
+    CFG["visionMaxFrames"] = int(_v.get("maxFrames", 8))
+    CFG["visionFrameSeconds"] = int(_v.get("frameSeconds", 2))
+    CFG["mediaBudget"] = int(_v.get("mediaTokenBudget", 8000))
 BASE = "https://www.kaggle.com/api/v1"
 OWNER = CFG["owner"]
 PROFILE = CFG["profile"]
@@ -132,6 +140,8 @@ MEMORY_TOOLS_PROMPT = (
     "asks what you remember, asks you to change or forget a memory, or explicitly "
     "wants the list. Do not create memories for small talk or temporary context.\n"
     "- Keep each memory short and factual (one or two sentences).\n"
+    "- When you emit a block, always emit it COMPLETE in one go: opening fence, "
+    "the JSON, closing fence — never stop mid-block.\n"
     "- You may emit multiple blocks in one reply if needed.\n"
     "- The app strips these blocks before your reply is shown; do not repeat their "
     "content in your visible text.\n"
@@ -647,7 +657,10 @@ def generate(sid, messages, settings, thinking, search_cfg):
     search_brief = None
     search_queries = []
     if search_cfg and search_cfg.get("enabled"):
-        search_brief, search_queries, messages = do_search(messages, search_cfg, settings)
+        search_brief, search_queries = do_search(messages, search_cfg, settings)
+        if search_brief:
+            messages = [dict(m) for m in messages]
+            messages[0]["content"] = (messages[0].get("content", "") + "\n\n" + search_brief).strip()
     stream = llm.create_chat_completion(
         messages=messages,
         temperature=float(settings.get("temperature", 0.7)),
@@ -777,14 +790,12 @@ def do_search(messages, search_cfg, settings):
     brief = dres["choices"][0]["message"]["content"].strip()
     if brief == "NO_RESULTS" or not brief:
         slog({"ev": "search", "phase": "empty"})
-        return None, queries, messages
+        return None, queries
     slog({"ev": "search", "phase": "brief", "data": brief[:120]})
-    new_messages = list(messages)
-    new_messages.insert(len(new_messages) - 1, {
-        "role": "system",
-        "content": "Fresh web research brief for the user's request (sources in parentheses):\n" + brief,
-    })
-    return brief, queries, new_messages
+    # returned as TEXT — the caller merges it into the single leading system
+    # message (the chat template forbids a second system message mid-list)
+    brief_text = ("Fresh web research brief for the user's request (sources in parentheses):\n" + brief)
+    return brief_text, queries
 
 # ------------------------------------------------------- memory ops (v3) ----
 MEM_CAP = 10000
@@ -930,13 +941,20 @@ def extract_memory_ops(text):
         if start < 0:
             cleaned_parts.append(rest)
             break
-        end = rest.find(BT, start + len(used))
-        body = rest[start + len(used):end] if end >= 0 else rest[start + len(used):]
         cleaned_parts.append(rest[:start])
-        if end >= 0:
-            rest = rest[end + 3:]
+        after = start + len(used)
+        tail = rest[after:]
+        if tail.lstrip("\n").startswith(BT + "json"):
+            # nested fence: marker, then a json sub-fence, then two closers
+            lead = len(tail) - len(tail.lstrip("\n"))
+            off = after + lead + len(BT) + 4
+            end = rest.find(BT, off)
+            body = rest[off:end] if end >= 0 else rest[off:]
+            rest = rest[end + 3:] if end >= 0 else ""
         else:
-            rest = ""
+            end = rest.find(BT, after)
+            body = rest[after:end] if end >= 0 else rest[after:]
+            rest = rest[end + 3:] if end >= 0 else ""
         body = body.strip()
         if body.startswith("json"):
             body = body[4:].strip()
@@ -1053,7 +1071,10 @@ def handle_chat(cmd):
             mem_state()["text"] = cmd["memory_text"]
             mem_state()["hash"] = cmd["memory_hash"]
 
-    msgs = [{"role": "system", "content": cmd.get("system", "")}]
+    # ONE system message, always first: the model's chat template hard-rejects
+    # any system message that is not the very first (Qwen3.x strict rule), so
+    # skills, memory tools and the memory log merge in as labeled sections.
+    sys_parts = [cmd.get("system", "")]
     skills = cmd.get("skills") or []
     if skills:
         blocks = []
@@ -1065,12 +1086,13 @@ def handle_chat(cmd):
                 b += "Why it exists: " + s["why"] + "\n"
             b += "---\n" + s.get("content", "") + "\n---"
             blocks.append(b)
-        msgs.append({"role": "system", "content": SKILLS_HANDLER_PROMPT + "\n\nThe skills:\n\n" + "\n\n".join(blocks)})
+        sys_parts.append(SKILLS_HANDLER_PROMPT + "\n\nThe skills:\n\n" + "\n\n".join(blocks))
     if bool(CFG.get("memoryTools", False)):
-        msgs.append({"role": "system", "content": MEMORY_TOOLS_PROMPT})
+        sys_parts.append(MEMORY_TOOLS_PROMPT)
         log_lines = mem_state().get("log", [])
         if log_lines:
-            msgs.append({"role": "system", "content": "Memory system results from your last operations:\n" + "\n".join(log_lines[-6:])})
+            sys_parts.append("Memory system results from your last operations:\n" + "\n".join(log_lines[-6:]))
+    msgs = [{"role": "system", "content": "\n\n".join(p for p in sys_parts if p)}]
 
     # build the LLM message list (media attached to the current user turn;
     # older media replaced with honest placeholders once the budget is spent)
@@ -1172,6 +1194,8 @@ def handle_config(cmd):
     patch = cmd.get("patch", {})
     if "afkSeconds" in patch:
         CFG["afkSeconds"] = max(60, int(patch["afkSeconds"]))
+    if "memoryTools" in patch:
+        CFG["memoryTools"] = bool(patch["memoryTools"])
     if "vision" in patch:
         v = patch["vision"] or {}
         CFG["visionEnabled"] = bool(v.get("enabled", False))
@@ -1182,7 +1206,7 @@ def handle_config(cmd):
             vision_unload()
         else:
             VISION["failed"] = None
-    slog({"ev": "config", "patch": {k: CFG.get(k) for k in ("afkSeconds", "visionEnabled", "visionMaxFrames", "visionFrameSeconds", "mediaBudget")}})
+    slog({"ev": "config", "patch": {k: CFG.get(k) for k in ("afkSeconds", "memoryTools", "visionEnabled", "visionMaxFrames", "visionFrameSeconds", "mediaBudget")}})
 
 def dispatch(cmd):
     global SEEN_V, LAST_CMD, LAST_DONE
@@ -1231,7 +1255,6 @@ def main():
         vision_check_ready()
     slog({"ev": "meta", "phase": "ready"})
     LAST_CMD = time.time()
-    BOOT_GRACE_END = time.time() + 600  # wait up to 10 min for the first command
     last_hb = time.time()
     first_cmd_seen = False
     while True:
@@ -1240,7 +1263,9 @@ def main():
             first_cmd_seen = True
             dispatch(cmd)
         if time.time() - last_hb > 45:
-            slog({"ev": "hb"})
+            # timestamp makes every heartbeat unique — the app dedupes exact
+            # repeats, and a deduped heartbeat would look like silence
+            slog({"ev": "hb", "t": int(time.time())})
             last_hb = time.time()
         threshold = int(CFG.get("afkSeconds", 180)) if first_cmd_seen else max(int(CFG.get("afkSeconds", 180)), 600)
         if time.time() - LAST_CMD > threshold:

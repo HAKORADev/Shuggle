@@ -51,7 +51,7 @@ export async function runInteractiveCli(opts: { dataDir: string }): Promise<void
 
   if (isPiped()) {
     // Deterministic line processing for piped input (scripts / tests)
-    initPiped();
+    await initPiped();
     while (true) {
       const line = nextPipedLine();
       if (line === null) break;

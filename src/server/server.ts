@@ -7,7 +7,8 @@ import { AppContext } from "../core/app.ts";
 import { newSession, activePath, addNode, renameAuto, switchDimension, branchOut, Msg, SessionData, childrenOf } from "../core/sessions.ts";
 import { buildSystemPrompt } from "../core/sysprompt.ts";
 import { mergeOverride } from "../core/settings.ts";
-import { activeSkills, skillsPrompt } from "../core/skills.ts";
+import { activeSkills } from "../core/skills.ts";
+import { extractMemoryOps } from "../core/memory.ts";
 import { poolAdd, poolRefresh, poolSummary, poolAutoPick } from "../core/tokens.ts";
 import { hsh16 } from "../core/util.ts";
 
@@ -103,7 +104,8 @@ export class Server {
         // been overwritten by a ping in the inbox — re-send it once.
         if (ev.state === "ready") {
           for (const task of this.tasks.values()) {
-            if (task.slot !== slot || (task as any).rescued) continue;
+            if (task.slot && task.slot !== slot) continue;
+            if ((task as any).rescued) continue;
             if (!task.turn || Date.now() - task.startedAt < 30_000) continue;
             (task as any).rescued = true;
             const slotObj = this.app.slots.get(slot);
@@ -116,23 +118,23 @@ export class Server {
         // asleep (or hiccuped), wake it again and let it pick the queued
         // command back up — the command is already in the inbox. Only give up
         // after a couple of attempts, and say so honestly when we do.
+        // Unassigned tasks (slot "") belong to the dying engine too — their
+        // ensureEngine was still booting it.
         if (ev.state === "error" || ev.state === "sleeping") {
           for (const [sid, task] of [...this.tasks.entries()]) {
-            if (task.slot !== slot) continue;
+            if (task.slot && task.slot !== slot) continue;
             const tries = ((task as any).wakeTries ?? 0) + 1;
             (task as any).wakeTries = tries;
             if (tries <= 2 && task.turn) {
               const slotObj = this.app.slots.get(slot);
               if (slotObj) {
-                void slotObj
-                  .wakeAndSend(task.turn)
-                  .catch(() => slotObj.boot({ id: slot, secret: this.app.tokens.tokens.find((t) => t.id === slot)?.secret } as any))
-                  .catch(() => {});
+                void slotObj.wakeAndSend(task.turn).catch(() => {});
                 continue; // keep the task alive — the engine is coming back
               }
             }
             this.tasks.delete(sid);
             const s = this.app.sessions.sessions[sid];
+            this.ensureAssistantNode(task);
             if (s && task.assistantMsgId && s.nodes[task.assistantMsgId]) {
               s.nodes[task.assistantMsgId].error =
                 ev.state === "error"
@@ -183,6 +185,8 @@ export class Server {
         const task = this.taskFor(ev.sid);
         if (!task) break;
         const s = this.app.sessions.sessions[task.sid];
+        // surface the failure even when no chunk ever arrived
+        this.ensureAssistantNode(task);
         if (s && task.assistantMsgId && s.nodes[task.assistantMsgId]) {
           s.nodes[task.assistantMsgId].error = humanError(ev.detail);
         }
@@ -193,7 +197,11 @@ export class Server {
       }
       case "resync": {
         // The engine's history diverged — push the active path fully, then
-        // continue the pending turn (the engine skips generation on resync).
+        // continue the pending turn. The continuation must match the state
+        // AFTER the resync: upto = hash of the full pushed path (which now
+        // includes this turn's user message) and EMPTY new_msgs — re-sending
+        // the original turn would hash against a pre-user snapshot that can
+        // never match again (that was a live resync loop).
         // One continuation per task: replayed resync events must not re-fire.
         const task = this.taskFor(ev.sid);
         if (!task || (task as any).continuing) break;
@@ -205,8 +213,18 @@ export class Server {
             const slot = this.app.slots.get(task.slot ?? ev.slot ?? "");
             if (!slot) return;
             await slot.resyncPath(task.sid, engineEntries(activePath(s)));
-            if (task.turn) await slot.wakeAndSend(task.turn);
-            (task as any).continuing = false;
+            if (task.turn) {
+              // "send": the pushed path already contains this turn's user
+              // message — continue against the post-resync hash, nothing to
+              // append. "retry": keep the original turn intact — its
+              // truncate_after_mid cuts the engine's history back to the
+              // retried message, which is the whole point of retry.
+              const continuation =
+                task.kind === "send"
+                  ? { ...task.turn, uptoHash: hsh16(engineEntries(activePath(s))), newMsgs: [] }
+                  : task.turn;
+              await slot.wakeAndSend(continuation);
+            }
           } catch (e: any) {
             this.tasks.delete(task.sid);
             this.broadcast("failed", { sid: task.sid, msgId: task.userMsgId, detail: e?.message ?? String(e) });
@@ -308,6 +326,12 @@ export class Server {
       content = outbox.content;
       thinking = outbox.thinking ?? null;
     }
+    // Streamed chunks can carry a partial memory-ops fence the kernel already
+    // stripped from its authoritative copy — strip any leaked fragments here.
+    content = extractMemoryOps(content).clean.replace(/```memory(?:-ops)?[\s\S]*$/, "").replace(/^\n+/, "");
+    // A turn can finish without a single streamed chunk reaching us (log
+    // stream hiccup, boot-edge races). The reply must still appear.
+    this.ensureAssistantNode(task);
     if (task.assistantMsgId && s.nodes[task.assistantMsgId]) {
       const n = s.nodes[task.assistantMsgId];
       n.content = content;
@@ -453,14 +477,16 @@ export class Server {
       const b = await req.json().catch(() => ({}));
       const prevAfk = this.app.settings.afkMinutes;
       const prevVision = JSON.stringify(this.app.settings.vision);
+      const prevMemTools = !!this.app.settings.memoryTools;
       this.app.settings = mergeUser(this.app.settings, b);
       // Clamp skills through the settings module for safety.
       this.app.settings = { ...this.app.settings, skills: this.app.settings.skills ?? [] };
       this.persist("settings");
-      if (this.app.settings.afkMinutes !== prevAfk || JSON.stringify(this.app.settings.vision) !== prevVision) {
+      if (this.app.settings.afkMinutes !== prevAfk || JSON.stringify(this.app.settings.vision) !== prevVision || !!this.app.settings.memoryTools !== prevMemTools) {
         for (const slot of this.app.slots.values()) {
           void slot.configure({
             afkSeconds: this.app.settings.afkMinutes * 60,
+            memoryTools: !!this.app.settings.memoryTools,
             vision: {
               enabled: this.app.settings.vision.enabled,
               maxFrames: this.app.settings.vision.maxFrames,
