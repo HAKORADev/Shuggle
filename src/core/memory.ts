@@ -42,7 +42,9 @@ export function serializeMemory(entries: MemoryEntry[]): string {
 
 export function parseMemoryBlocks(text: string): { name: string; id: string; text: string }[] {
   const out: { name: string; id: string; text: string }[] = [];
-  const re = /^## (.+?) #([A-Za-z0-9]+)\n([\s\S]*?)(?=^## |\Z)/gm;
+  // NOTE: JS regexes have no \Z — "\Z" is a literal "Z", which silently made
+  // this match the FIRST block only. $(?![\s\S]) is the real end-of-string.
+  const re = /^## (.+?) #([A-Za-z0-9]+)\n([\s\S]*?)(?=^## |$(?![\s\S]))/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
     out.push({ name: m[1].trim(), id: m[2], text: m[3].trim() });

@@ -800,6 +800,7 @@ export class Server {
           task.turn = turn;
           await slot.wakeAndSend(turn);
         } catch (e: any) {
+          if (process.env.SHUGGLE_DEBUG) console.error(`[send] failed: ${e?.message ?? e}`);
           this.tasks.delete(s.id);
           const n = s.nodes[userNode.id];
           if (n) n.error = humanError(e?.message ?? e);
@@ -1138,7 +1139,11 @@ function mergeUser(current: any, patch: any) {
 
 function humanError(detail: any): string {
   const d = String(detail ?? "");
+  if (/Maximum batch GPU session count/i.test(d))
+    return "Kaggle is already running 2 GPU sessions on this account. Wait for one to finish, or close an engine you're not using from the status panel.";
   if (/429|rate.?limit|too many/i.test(d)) return "Kaggle is rate-limiting the relay for a moment. Give it a few seconds and send again — the engine itself is fine.";
+  if (/Maximum.*GPU|accelerator.*unavailable|no accelerator/i.test(d))
+    return "Kaggle has no free GPU for this account right now. Try again in a few minutes.";
   if (d.includes("exceed") || d.includes("context")) return "This reply went over the model's context window. Try a shorter message or clear the chat.";
   if (d.includes("CUDA") || d.includes("out of memory") || d.toLowerCase().includes("oom")) return "The GPUs ran out of memory. Restarting the engine usually fixes it.";
   if (d.includes("offline") || d.includes("internet")) return "The engine lost its internet connection. Try again in a moment.";

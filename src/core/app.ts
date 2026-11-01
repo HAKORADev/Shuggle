@@ -159,6 +159,7 @@ export class AppContext {
         username,
         secret: rec.secret,
         profile: this.profile?.name ?? "default",
+        deviceSignature: this.device.signature,
         contextTokens: this.settings.contextTokens,
         afkSeconds: this.settings.afkMinutes * 60,
         events: this.events,
