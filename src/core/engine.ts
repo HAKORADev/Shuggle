@@ -220,7 +220,7 @@ export class EngineSlot {
       // A session claims to be alive. Verify it actually produces output —
       // Kaggle occasionally leaves zombie sessions (RUNNING with no logs)
       // that would silently queue every new push behind them for hours.
-      const alive = await this.sessionProducesOutput(12_000);
+      const alive = await this.probeEngineAlive(40_000);
       if (alive) {
         this.setState("waking", "Connecting to your engine");
         this.lastSseAt = Date.now();
@@ -232,6 +232,30 @@ export class EngineSlot {
       await sleep(4_000);
     }
     await this.pushAndAttach(record, force ? "Restarting your engine" : "Starting your engine");
+  }
+
+  /**
+   * Prove the engine is really alive.
+   *
+   * The log stream REPLAYS the whole session log on every connect, so "there
+   * is output" proves nothing — a dead session still has plenty. Instead we
+   * ask the engine something and wait for its echo: the echo carries the
+   * command id we just sent, and no replay can fake that.
+   */
+  private async probeEngineAlive(timeoutMs = 40_000): Promise<boolean> {
+    let v = 0;
+    try {
+      v = await this.sendCmd({ type: "stay" });
+    } catch {
+      return false;
+    }
+    if (!v) return false;
+    const until = Date.now() + timeoutMs;
+    while (Date.now() < until) {
+      if (this.echoedVs.has(v)) return true;
+      await sleep(400);
+    }
+    return false;
   }
 
   /** True if the kernel's live log yields any line within `windowMs`. */
@@ -655,6 +679,9 @@ export class EngineSlot {
       case "hb":
         break;
       case "cmd":
+        // The engine echoes every command it reads. Matching on the command
+        // id tells a live engine apart from a replayed log.
+        if (typeof j.v === "number") this.echoedVs.add(j.v);
         break;
       case "err":
         // Non-fatal engine-side error; surface quietly in logs.
@@ -672,10 +699,11 @@ export class EngineSlot {
 
   /** Push a command into the engine's inbox. Serialized per slot with
    *  spacing, and insistent through Kaggle's rate limits. Media files ride
-   *  in the same dataset version as cmd.json — the engine fetches them by name. */
+   *  in the same dataset version as cmd.json — the engine fetches them by name.
+   *  Returns the command id (v) that was written. */
   private sendQueue: Promise<void> = Promise.resolve();
 
-  private sendCmd(cmd: Record<string, any>, files: Record<string, string | Uint8Array> = {}): Promise<void> {
+  private async sendCmd(cmd: Record<string, any>, files: Record<string, string | Uint8Array> = {}): Promise<number> {
     const run = async () => {
       cmd.v = this.nextV();
       cmd.profile = this.profile;
@@ -686,7 +714,7 @@ export class EngineSlot {
           await this.kaggle.datasetUpsert(this.username, `shuggle-inbox-${this.ns}`, "Shuggle Inbox", payload, `v${cmd.v}`);
           this.lastPushAt = Date.now();
           this.lastCmdSentAt = Date.now();
-          return;
+          return cmd.v;
         } catch (e: any) {
           lastErr = e;
           const msg = String(e?.message ?? e);
@@ -704,13 +732,23 @@ export class EngineSlot {
       const gap = Date.now() - (this.lastPushAt ?? 0);
       if (gap < 2500) await sleep(2500 - gap);
     });
-    this.sendQueue = spaced.then(run).catch(() => {
-      // keep the queue alive even when a command ultimately fails
-    });
-    return spaced.then(() => this.sendQueue);
+    let written = 0;
+    this.sendQueue = spaced
+      .then(run)
+      .then((v) => {
+        written = v;
+      })
+      .catch(() => {
+        // keep the queue alive even when a command ultimately fails
+      });
+    await spaced;
+    await this.sendQueue;
+    return written;
   }
 
   private lastPushAt = 0;
+  /** Command ids the engine has echoed back — proof that it is really alive. */
+  private echoedVs = new Set<number>();
 
   async wakeAndSend(turn: ChatTurn): Promise<void> {
     dbg(`wakeAndSend: state=${this.state} sid=${turn.sid.slice(0, 8)}`);
@@ -891,35 +929,48 @@ for FILENAME, GB in FILES:
     slog("Uploading " + FILENAME + " to your Kaggle storage (" + str(GB) + " GB)")
     t0 = time.time()
     sent = 0
+    attempts = 0
     with open(path, "rb") as f:
         while sent < size:
+            if attempts > 40:
+                slog("Upload gave up after too many retries")
+                break
             f.seek(sent)
             chunk = f.read(CHUNK)
-            headers = {"Content-Length": str(len(chunk)), "Content-Type": "application/octet-stream"}
-            headers["Content-Range"] = "bytes " + str(sent) + "-" + str(sent + len(chunk) - 1) + "/" + str(size)
+            end = sent + len(chunk) - 1
+            headers = {"Content-Length": str(len(chunk)), "Content-Type": "application/octet-stream",
+                       "Content-Range": "bytes " + str(sent) + "-" + str(end) + "/" + str(size)}
             req = urllib.request.Request(j["createUrl"], data=chunk, headers=headers, method="PUT")
+            code = 0
+            rng = ""
             try:
                 with urllib.request.urlopen(req, timeout=900) as r:
                     code = r.status
-                    rng = r.headers.get("Range", "")
+                    rng = r.headers.get("Range", "") or ""
             except urllib.error.HTTPError as e:
                 code = e.code
-                rng = e.headers.get("Range", "") if e.headers else ""
-                if code not in (200, 201, 308):
+                rng = (e.headers.get("Range", "") if e.headers else "") or ""
+                if code >= 500:
+                    attempts += 1
                     time.sleep(3)
                     continue
+                if code not in (200, 201, 308):
+                    slog("Upload failed with HTTP " + str(code))
+                    raise
             if code in (200, 201):
                 sent = size
                 break
-            # 308 Resume Incomplete — the server reports how much it already has
+            # 308 Resume Incomplete — the server tells us how much it already has
             if rng.startswith("bytes=0-"):
                 have = int(rng.split("-")[1]) + 1
                 if have <= sent:
+                    attempts += 1
                     time.sleep(3)
                     continue
                 sent = have
             else:
                 sent += len(chunk)
+            attempts = 0
             if sent % (CHUNK * 16) < CHUNK or sent >= size:
                 rate = sent / max(1e-9, time.time() - t0) / 1e6
                 slog("Uploaded " + str(round(sent / 1e9, 2)) + " / " + str(round(size / 1e9, 2)) + " GB (" + str(int(rate)) + " MB/s)")
