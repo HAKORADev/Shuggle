@@ -13,6 +13,7 @@ import { engineScript } from "./kernel.ts";
 import { hsh16 } from "./util.ts";
 import { TokenRecord } from "./tokens.ts";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 
 export type SlotState = "idle" | "seeding" | "booting" | "waking" | "ready" | "generating" | "sleeping" | "error";
 export type VisionState = "unknown" | "ready" | "unavailable" | "off";
