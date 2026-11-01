@@ -106,14 +106,8 @@ async function say(text: string, a: ReturnType<typeof api>): Promise<void> {
   if (!session || generating) return;
   generating = true;
   genStart = Date.now();
-  let have = { text: "", think: "" };
-  try {
-    // listen to the stream for this reply
-    const es = new EventSource(`http://127.0.0.1:${(a as any).port ?? ""}`);
-    // EventSource with port unknown here — use closure instead:
-  } catch {
-    /* fall through to polling */
-  }
+  let have = { text: "", think: "" }; // kept for future streaming refactor
+  void have;
   const r = (await a.post(`/api/sessions/${session!.id}/send`, { text })) as any;
   if (r.error) {
     console.log(`\n  ${r.error}\n`);
@@ -233,7 +227,7 @@ async function command(text: string, a: ReturnType<typeof api>): Promise<void> {
     }
     case "rename": {
       if (!session || !argStr) break;
-      await a.put(`/api/sessions/${session.id}`, { name: argStr });
+      await a.patch(`/api/sessions/${session.id}`, { name: argStr });
       session.name = argStr;
       console.log(`  Renamed to "${argStr}"`);
       break;
@@ -256,7 +250,7 @@ async function command(text: string, a: ReturnType<typeof api>): Promise<void> {
     case "pin": {
       if (!session) break;
       const cur = snap.sessions.find((x) => x.id === session!.id);
-      await a.put(`/api/sessions/${session.id}`, { pinned: !cur?.pinned });
+      await a.patch(`/api/sessions/${session.id}`, { pinned: !cur?.pinned });
       console.log(cur?.pinned ? "  Unpinned" : "  Pinned");
       break;
     }
@@ -264,7 +258,7 @@ async function command(text: string, a: ReturnType<typeof api>): Promise<void> {
       if (!session) break;
       const full = (await a.get(`/api/sessions/${session.id}`)) as any;
       const next = !full.session.searchEnabled;
-      await a.put(`/api/sessions/${session.id}`, { searchEnabled: next });
+      await a.patch(`/api/sessions/${session.id}`, { searchEnabled: next });
       console.log(next ? "  Web search: on" : "  Web search: off");
       break;
     }
@@ -272,7 +266,7 @@ async function command(text: string, a: ReturnType<typeof api>): Promise<void> {
       if (!session) break;
       const full = (await a.get(`/api/sessions/${session.id}`)) as any;
       const next = !full.session.thinkingEnabled;
-      await a.put(`/api/sessions/${session.id}`, { thinkingEnabled: next });
+      await a.patch(`/api/sessions/${session.id}`, { thinkingEnabled: next });
       console.log(next ? "  Thinking: shown" : "  Thinking: hidden");
       break;
     }
@@ -299,9 +293,7 @@ async function command(text: string, a: ReturnType<typeof api>): Promise<void> {
         console.log("  /use <n> — pick a token number from /tokens");
         break;
       }
-      await a.put(`/api/sessions/${session.id}`, {});
-      // bind by waking this engine then flagging the session
-      await a.post("/api/engine/wake", { username: t.id });
+      await a.patch(`/api/sessions/${session.id}`, { engineUsername: t.id });
       console.log(`  Using ${t.id} for "${session.name}"`);
       break;
     }

@@ -56,12 +56,35 @@ export async function connectServer(dataDir: string): Promise<Bridge> {
     fetch: (req) => server.handle(req),
   });
   server.startPings();
-  // process state check + login if needed
+  // process state check + login/onboarding
   const st = await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();
   if (!st.hasAccount) {
-    throw new Error("no account on this device yet — run `shuggle` once to create one");
-  }
-  if (!st.loggedIn) {
+    // First run on this device — create the account right here, no GUI needed.
+    console.log("\n  First run on this device — let's make your Shuggle account.");
+    console.log("  One account lives on this device; your data stays in the app folder, encrypted.\n");
+    let name = "";
+    for (let i = 0; i < 3; i++) {
+      name = (await question("  account name: ")).trim();
+      if (/^[a-zA-Z0-9_-]{1,32}$/.test(name)) break;
+      console.log("  names can use letters, numbers, _ and - (max 32)");
+      name = "";
+    }
+    if (!name) throw new Error("no account name given");
+    let pass = await promptHidden("  password: ");
+    let pass2 = await promptHidden("  confirm password: ");
+    if (pass !== pass2) throw new Error("passwords do not match");
+    if (!pass) throw new Error("password cannot be empty");
+    const cr = await fetch(`http://127.0.0.1:${port}/api/account`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, password: pass }),
+    });
+    if (!cr.ok) {
+      const j = await cr.json().catch(() => ({ error: "account creation failed" }));
+      throw new Error(j.error ?? "account creation failed");
+    }
+    console.log(`\n  Welcome, ${name}.\n`);
+  } else if (!st.loggedIn) {
     const password = await promptHidden("  password: ");
     const lr = await fetch(`http://127.0.0.1:${port}/api/login`, {
       method: "POST",
@@ -90,6 +113,12 @@ export function api(port: number) {
     put: (p: string, body?: any) =>
       fetch(base + p, {
         method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: body ? JSON.stringify(body) : undefined,
+      }).then((r) => r.json()),
+    patch: (p: string, body?: any) =>
+      fetch(base + p, {
+        method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: body ? JSON.stringify(body) : undefined,
       }).then((r) => r.json()),

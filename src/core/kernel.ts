@@ -25,6 +25,8 @@ export interface EngineConfig {
   profile: string;
   contextTokens: number;
   afkSeconds: number;
+  memoryTools: boolean;
+  vision: { enabled: boolean; maxFrames: number; frameSeconds: number; mediaBudget: number };
 }
 
 interface CmdChat {
@@ -70,6 +72,13 @@ import urllib.parse
 import urllib.request
 
 CFG = json.loads(r'''__CONFIG__''')
+# flatten the vision/memory knobs so the engine reads them as plain keys
+_v = CFG.get("vision") or {}
+CFG["visionEnabled"] = bool(_v.get("enabled", False))
+CFG["visionMaxFrames"] = int(_v.get("maxFrames", 8))
+CFG["visionFrameSeconds"] = int(_v.get("frameSeconds", 2))
+CFG["mediaBudget"] = int(_v.get("mediaBudget", 8000))
+CFG["memoryTools"] = bool(CFG.get("memoryTools", False))
 BASE = "https://www.kaggle.com/api/v1"
 OWNER = CFG["owner"]
 PROFILE = CFG["profile"]
@@ -279,6 +288,8 @@ VISION = {"handler": None, "mmproj": None, "name": None, "failed": None}
 CHARS_PER_TOKEN = 3.2
 IMAGE_TOKEN_EST = 600   # 768px ViT, patch16, 2x2 merge -> ~576 embeddings + overhead
 LAST_DONE = None        # last finished reply — the sleeping outbox carries it
+LAST_CMD_V = 0          # version of the command being processed — tags every
+                        # generation event so the app can drop stale replays
 
 def ensure_deps():
     global llm
@@ -603,6 +614,7 @@ class Splitter:
         return None
 
 def generate(sid, messages, settings, thinking, search_cfg):
+    cmd_v = LAST_CMD_V
     if not thinking:
         messages = [dict(m) for m in messages]
         if messages and messages[-1]["role"] == "user":
@@ -636,7 +648,7 @@ def generate(sid, messages, settings, thinking, search_cfg):
         if now - last_emit > 0.45:
             for k in ("think", "text"):
                 if pending[k]:
-                    slog({"ev": "chunk", "sid": sid, "seq": seq, "k": k, "t": pending[k]})
+                    slog({"ev": "chunk", "sid": sid, "seq": seq, "k": k, "t": pending[k], "v": cmd_v})
                     seq += 1
                     pending[k] = ""
             last_emit = now
@@ -644,7 +656,7 @@ def generate(sid, messages, settings, thinking, search_cfg):
     reclass = fin == "reclass"
     for k in ("think", "text"):
         if pending[k]:
-            slog({"ev": "chunk", "sid": sid, "seq": seq, "k": k, "t": pending[k]})
+            slog({"ev": "chunk", "sid": sid, "seq": seq, "k": k, "t": pending[k], "v": cmd_v})
             seq += 1
             pending[k] = ""
     gen_ms = int((time.time() - t0) * 1000)
@@ -652,7 +664,7 @@ def generate(sid, messages, settings, thinking, search_cfg):
     content_out = sp.text_full if not reclass else (sp.think_full + sp.text_full)
     content_out = content_out.lstrip("\n")
     if reclass:
-        slog({"ev": "reclass", "sid": sid})
+        slog({"ev": "reclass", "sid": sid, "v": cmd_v})
     return {
         "content": content_out,
         "thinking": thinking_out,
@@ -715,35 +727,35 @@ def do_search(messages, search_cfg, settings):
     max_q = int(search_cfg.get("max_queries", 3))
     pages = int(search_cfg.get("pages_per_query", 1))
     convo_tail = "\n".join(m.get("content", "")[:600] if isinstance(m.get("content"), str) else "" for m in messages[-6:])
-    slog({"ev": "search", "phase": "planning"})
+    slog({"ev": "search", "phase": "planning", "v": LAST_CMD_V})
     res = llm.create_chat_completion(
         messages=[{"role": "system", "content": SEARCH_QUERIES_PROMPT.replace("{max_q}", str(max_q))},
                   {"role": "user", "content": convo_tail}],
         temperature=0.2, max_tokens=120)
     raw = res["choices"][0]["message"]["content"].strip()
     queries = [q.strip("-*0123456789. ") for q in raw.splitlines() if q.strip()][:max_q]
-    slog({"ev": "search", "phase": "queries", "data": queries})
+    slog({"ev": "search", "phase": "queries", "data": queries, "v": LAST_CMD_V})
     all_results = []
     for q in queries:
         all_results.extend(ddg_fetch(q, pages))
     all_results = all_results[:24]
-    slog({"ev": "search", "phase": "results", "data": len(all_results)})
+    slog({"ev": "search", "phase": "results", "data": len(all_results), "v": LAST_CMD_V})
     if not all_results:
         return None, queries, messages
     blobs = []
     for i, r in enumerate(all_results):
         blobs.append(f"[{i+1}] {r['title']} — {r['snippet']}")
     results_text = "\n".join(blobs)[:9000]
-    slog({"ev": "search", "phase": "digesting"})
+    slog({"ev": "search", "phase": "digesting", "v": LAST_CMD_V})
     dres = llm.create_chat_completion(
         messages=[{"role": "system", "content": SEARCH_DIGEST_PROMPT},
                   {"role": "user", "content": "User request:\n" + convo_tail[-1500:] + "\n\nResults:\n" + results_text}],
         temperature=0.2, max_tokens=900)
     brief = dres["choices"][0]["message"]["content"].strip()
     if brief == "NO_RESULTS" or not brief:
-        slog({"ev": "search", "phase": "empty"})
+        slog({"ev": "search", "phase": "empty", "v": LAST_CMD_V})
         return None, queries, messages
-    slog({"ev": "search", "phase": "brief", "data": brief[:120]})
+    slog({"ev": "search", "phase": "brief", "data": brief[:120], "v": LAST_CMD_V})
     new_messages = list(messages)
     new_messages.insert(len(new_messages) - 1, {
         "role": "system",
@@ -950,8 +962,9 @@ def handle_mem(cmd):
         save_store()
     elif cmd["type"] == "mem_get":
         mem = mem_state()
-        slog({"ev": "mem", "hash": mem.get("hash", ""), "text": mem.get("text", "")[:2000],
-              "deleted": len(mem.get("deleted", []))})
+        # hash + counts only — the full text lives in the app already; a sliced
+        # echo here would once overwrite the user's real memory with a stub
+        slog({"ev": "mem", "hash": mem.get("hash", ""), "deleted": len(mem.get("deleted", []))})
 
 # ------------------------------------------------------------- dispatcher ----
 def history_projection(hist):
@@ -1090,13 +1103,13 @@ def handle_chat(cmd):
             except Exception:
                 pass
 
-    slog({"ev": "gen-start", "sid": sid})
+    slog({"ev": "gen-start", "sid": sid, "v": LAST_CMD_V})
     try:
         result = generate(sid, llm_msgs, cmd.get("settings", {}),
                           bool(cmd.get("thinking", True)), cmd.get("search"))
     except Exception as e:
         err("generate", e)
-        slog({"ev": "failed", "sid": sid, "d": str(e)[:300]})
+        slog({"ev": "failed", "sid": sid, "d": str(e)[:300], "v": cmd.get("v", 0)})
         outbox_push({"ev": "failed", "sid": sid, "v": cmd.get("v", 0), "d": str(e)[:300]})
         return
     mem_results = None
@@ -1113,7 +1126,7 @@ def handle_chat(cmd):
           "out_tokens": result["out_tokens"], "chars": len(result["content"]),
           "think_chars": len(result["thinking"] or ""), "search_brief": result["search_brief"],
           "search_queries": result["search_queries"],
-          "mem_results": mem_results})
+          "mem_results": mem_results, "v": cmd.get("v", 0)})
     outbox_push({"ev": "done", "sid": sid, "v": cmd.get("v", 0), "gen_ms": result["gen_ms"],
                  "chars": len(result["content"]), "think_chars": len(result["thinking"] or ""),
                  "content": result["content"],
@@ -1122,7 +1135,7 @@ def handle_chat(cmd):
                  "search_queries": result["search_queries"],
                  "mem_results": mem_results})
     global LAST_DONE
-    LAST_DONE = {"sid": sid, "v": cmd.get("v", 0), "gen_ms": result["gen_ms"], "content": result["content"],
+    LAST_DONE = {"sid": sid, "v": cmd.get("v", 0), "msg_id": cmd.get("msg_id"), "gen_ms": result["gen_ms"], "content": result["content"],
                  "thinking": result["thinking"], "mem_results": mem_results}
     save_store()
 
@@ -1137,6 +1150,8 @@ def handle_config(cmd):
     patch = cmd.get("patch", {})
     if "afkSeconds" in patch:
         CFG["afkSeconds"] = max(60, int(patch["afkSeconds"]))
+    if "memoryTools" in patch:
+        CFG["memoryTools"] = bool(patch["memoryTools"])
     if "vision" in patch:
         v = patch["vision"] or {}
         CFG["visionEnabled"] = bool(v.get("enabled", False))
@@ -1147,14 +1162,15 @@ def handle_config(cmd):
             vision_unload()
         else:
             VISION["failed"] = None
-    slog({"ev": "config", "patch": {k: CFG.get(k) for k in ("afkSeconds", "visionEnabled", "visionMaxFrames", "visionFrameSeconds", "mediaBudget")}})
+    slog({"ev": "config", "patch": {k: CFG.get(k) for k in ("afkSeconds", "visionEnabled", "visionMaxFrames", "visionFrameSeconds", "mediaBudget", "memoryTools")}})
 
 def dispatch(cmd):
-    global SEEN_V, LAST_CMD, LAST_DONE
+    global SEEN_V, LAST_CMD, LAST_DONE, LAST_CMD_V
     if cmd.get("profile") and cmd["profile"] != PROFILE:
         slog({"ev": "err", "where": "profile", "d": "command is for another profile"})
         return
     SEEN_V = cmd.get("v", SEEN_V + 1)
+    LAST_CMD_V = int(cmd.get("v", 0))
     LAST_CMD = time.time()
     t = cmd.get("type", "")
     slog({"ev": "cmd", "v": cmd.get("v"), "type": t})

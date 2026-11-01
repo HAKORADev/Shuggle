@@ -555,3 +555,7 @@ textarea.mem-edit:focus { border-color: var(--accent-strong); box-shadow: 0 0 0 
 
 /* toast tweak for vision info */
 .toast { max-width: 420px; }
+
+/* in-app link viewer */
+.link-viewer iframe { width: 100%; height: 66vh; border: 0; border-radius: 10px; background: #fff; }
+.link-note { font-size: 12px; color: var(--dim, #9aa0a6); line-height: 1.5; }

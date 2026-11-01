@@ -17,15 +17,37 @@ jobs:
         run: bun build src/ui/app.ts --minify --format=iife --outfile=src/ui/app.bundle.js
       - name: Compile single binary
         run: bun build src/shuggle.ts --compile --outfile=shuggle
-      - name: Smoke test
+      - name: Smoke test (CLI + server + UI assets)
         run: |
           ./shuggle version
           ./shuggle help | head -5
+          mkdir -p /tmp/shuggle-ci && cd /tmp/shuggle-ci
+          "$GITHUB_WORKSPACE/shuggle" serve --port=8799 &
+          SERVER_PID=$!
+          sleep 2
+          curl -sf http://127.0.0.1:8799/api/health
+          # the exe must serve a REAL UI — this catches blank-asset builds
+          [ "$(curl -s http://127.0.0.1:8799/ | wc -c)" -gt 1000 ] || (echo "index.html is empty" && exit 1)
+          [ "$(curl -s http://127.0.0.1:8799/app.js | wc -c)" -gt 1000 ] || (echo "app.js is empty" && exit 1)
+          curl -sf -o /dev/null http://127.0.0.1:8799/favicon.png
+          kill $SERVER_PID
+      - name: Compress (UPX)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq upx-ucl
+          upx -q --best shuggle || echo "upx failed — shipping uncompressed"
+          ./shuggle version
+      - name: Prepare folder (binary + launchers)
+        run: |
+          mkdir -p bundle
+          cp shuggle bundle/
+          cp launcher/shuggle.sh bundle/
+          cp launcher/shuggle-lan.sh bundle/
+          chmod +x bundle/shuggle bundle/shuggle.sh bundle/shuggle-lan.sh
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Shuggle-linux-x64
-          path: shuggle
+          path: bundle/
           compression-level: 9
 
   windows:
@@ -40,20 +62,28 @@ jobs:
       - name: Compile single binary
         shell: bash
         run: bun build src/shuggle.ts --compile --windows-icon=assets/shuggle.ico --windows-hide-console --windows-title="Shuggle" --windows-publisher="HAKORA" --windows-version="0.5.0.0" --windows-description="Free chats on free GPUs" --outfile=Shuggle.exe
-      - name: Smoke test
+      - name: Smoke test (CLI + server + UI assets)
         shell: bash
         run: |
           ./Shuggle.exe version
           ./Shuggle.exe help | head -5
-      - name: Prepare folder (exe + launchers)
+          mkdir -p /tmp/shuggle-ci && cd /tmp/shuggle-ci
+          "$GITHUB_WORKSPACE/Shuggle.exe" serve --port=8799 &
+          SERVER_PID=$!
+          sleep 3
+          curl -sf http://127.0.0.1:8799/api/health
+          [ "$(curl -s http://127.0.0.1:8799/ | wc -c)" -gt 1000 ] || (echo "index.html is empty" && exit 1)
+          [ "$(curl -s http://127.0.0.1:8799/app.js | wc -c)" -gt 1000 ] || (echo "app.js is empty" && exit 1)
+          curl -sf -o /dev/null http://127.0.0.1:8799/favicon.png
+          kill $SERVER_PID
+      - name: Prepare folder (exe + Windows launchers only)
         shell: bash
         run: |
           mkdir -p bundle
           cp Shuggle.exe bundle/
           cp launcher/"Shuggle.bat" bundle/
+          cp launcher/"Shuggle CLI.bat" bundle/
           cp launcher/"Shuggle LAN.bat" bundle/
-          cp launcher/shuggle.sh bundle/
-          cp launcher/shuggle-lan.sh bundle/
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

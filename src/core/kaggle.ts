@@ -26,6 +26,13 @@ function slugifyTitle(title: string): string {
 export class Kaggle {
   constructor(public bearer: string) {}
 
+  /** Shared backoff after a 429: every poller of this client checks this and
+   *  goes quiet, so a rate-limited token recovers instead of drowning. */
+  coolUntil = 0;
+  cooling(): boolean {
+    return Date.now() < this.coolUntil;
+  }
+
   private headers(extra: Record<string, string> = {}): Record<string, string> {
     return {
       Authorization: `Bearer ${this.bearer}`,
@@ -45,6 +52,7 @@ export class Kaggle {
         body: JSON.stringify(body ?? {}),
         signal: ctrl.signal,
       });
+      if (r.status === 429) this.coolUntil = Date.now() + 45_000;
       const text = await r.text();
       let parsed: any = text;
       try {
@@ -134,6 +142,7 @@ export class Kaggle {
   async kernelStatus(owner: string, slug: string): Promise<{ status: string; failureMessage?: string }> {
     // 403 with PERMISSION_DENIED means "no such kernel" in practice.
     const r = await this.rpc("kernels.KernelsApiService/GetKernelSessionStatus", { userName: owner, kernelSlug: slug });
+    if (r.status === 429) throw new KaggleError("Kaggle rate limit — backing off", 429);
     if (r.status === 403) return { status: "NEVER_RUN" };
     if (r.status !== 200) return { status: "UNKNOWN" };
     return {
@@ -161,8 +170,13 @@ export class Kaggle {
 
   /** Live log stream (SSE). Returns an async iterable of text events. */
   async *logStream(owner: string, slug: string, signal?: AbortSignal): AsyncGenerator<string> {
+    if (this.cooling()) return; // don't reconnect into a rate-limit storm
     const url = `${BASE}/kernels/logs/stream/${owner}/${slug}`;
     const r = await fetch(url, { headers: this.headers(), signal });
+    if (r.status === 429) {
+      this.coolUntil = Date.now() + 45_000;
+      return;
+    }
     if (!r.ok || !r.body) return;
     const reader = r.body.getReader();
     const decoder = new TextDecoder();
@@ -276,6 +290,7 @@ export class Kaggle {
 
   async datasetDownloadText(owner: string, slug: string, fileName: string): Promise<string | null> {
     // POST returns 302 to a signed URL; fetch follows redirects transparently.
+    if (this.cooling()) return null;
     try {
       const r = await fetch(`${BASE}/datasets.DatasetApiService/DownloadDataset`, {
         method: "POST",
@@ -283,6 +298,7 @@ export class Kaggle {
         body: JSON.stringify({ ownerSlug: owner, datasetSlug: slug, fileName, raw: true }),
         redirect: "follow",
       });
+      if (r.status === 429) this.coolUntil = Date.now() + 45_000;
       if (r.status === 404) return null;
       if (!r.ok) return null;
       return await r.text();

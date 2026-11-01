@@ -293,7 +293,7 @@ export class Server {
 
     // static UI
     if (method === "GET" && !path.startsWith("/api/")) {
-      return this.static(path);
+      return await this.serveStatic(path);
     }
 
     if (path === "/api/health") return this.json({ ok: true, app: "shuggle" });
@@ -366,19 +366,34 @@ export class Server {
       });
     }
 
-    // ---- settings (vision/afk changes apply to live engines — no restart)
+    // ---- settings (everything here applies live — vision, memory tools and
+    // the rest timer reach running engines on their next loop tick; the ONLY
+    // thing that ever needs an engine restart is the context window size)
     if (path === "/api/settings" && method === "PUT") {
       const b = await req.json().catch(() => ({}));
       const prevAfk = this.app.settings.afkMinutes;
       const prevVision = JSON.stringify(this.app.settings.vision);
+      const prevMemTools = this.app.settings.memoryTools;
       this.app.settings = mergeUser(this.app.settings, b);
       // Clamp skills through the settings module for safety.
       this.app.settings = { ...this.app.settings, skills: this.app.settings.skills ?? [] };
       this.persist("settings");
-      if (this.app.settings.afkMinutes !== prevAfk || JSON.stringify(this.app.settings.vision) !== prevVision) {
+      // Remember the window-shell preference so the next launch opens the
+      // app window accordingly (the exe reads this hint before login).
+      try {
+        await Bun.write(join(this.app.dataDir, "ui-prefs.json"), JSON.stringify({ useEdgeData: !!this.app.settings.useEdgeData }));
+      } catch {
+        /* non-fatal */
+      }
+      if (
+        this.app.settings.afkMinutes !== prevAfk ||
+        JSON.stringify(this.app.settings.vision) !== prevVision ||
+        this.app.settings.memoryTools !== prevMemTools
+      ) {
         for (const slot of this.app.slots.values()) {
           void slot.configure({
             afkSeconds: this.app.settings.afkMinutes * 60,
+            memoryTools: this.app.settings.memoryTools,
             vision: {
               enabled: this.app.settings.vision.enabled,
               maxFrames: this.app.settings.vision.maxFrames,
@@ -459,6 +474,7 @@ export class Server {
           if (typeof b.memoryEnabled === "boolean") s.memoryEnabled = b.memoryEnabled;
           if (typeof b.visionEnabled === "boolean") s.visionEnabled = b.visionEnabled;
           if (typeof b.compareWith === "string" || b.compareWith === null) s.compareWith = b.compareWith;
+          if (typeof b.engineUsername === "string" || b.engineUsername === null) s.engineUsername = b.engineUsername;
           if (b.override !== undefined) s.override = b.override;
           this.persist("sessions");
           return this.json({ ok: true });
@@ -566,9 +582,7 @@ export class Server {
     // ---- SSE stream
     if (path === "/api/stream" && method === "GET") {
       const encoder = new TextEncoder();
-      const sub = (ev: any) => {
-        /* placeholder — real send handled via listener below */
-      };
+      let cleanup: (() => void) | null = null;
       const stream = new ReadableStream({
         start: (ctrl) => {
           const send = (data: any) => {
@@ -589,14 +603,15 @@ export class Server {
               clearInterval(ka);
             }
           }, 15_000);
-          // @ts-ignore cleanup on cancel
-          ctrl._cleanup = () => {
+          cleanup = () => {
             clearInterval(ka);
             this.app.events.off("sse", listener);
           };
         },
-        cancel: (ctrlAny: any) => {
-          /* handled via _cleanup on close below */
+        cancel: () => {
+          // client disconnected (window closed, LAN tab closed) — stop fanning out
+          cleanup?.();
+          cleanup = null;
         },
       });
       return new Response(stream, {
@@ -726,6 +741,9 @@ export class Server {
       this.broadcast("session", { sid: s.id, reason: "user-added", msgId: userNode.id });
       return this.json({ ok: true, userMsgId: userNode.id });
     } catch (e: any) {
+      // never leave a phantom task behind — it would block every future send
+      this.tasks.delete(s.id);
+      this.broadcast("failed", { sid: s.id, msgId: null, detail: e?.message ?? String(e) });
       return this.fail(e, 500);
     }
   }
@@ -785,6 +803,8 @@ export class Server {
       this.broadcast("session", { sid: s.id, reason: "retry", userMsgId });
       return this.json({ ok: true });
     } catch (e: any) {
+      this.tasks.delete(s.id);
+      this.broadcast("failed", { sid: s.id, msgId: null, detail: e?.message ?? String(e) });
       return this.fail(e, 500);
     }
   }
@@ -861,6 +881,8 @@ export class Server {
       this.broadcast("session", { sid: s.id, reason: "edited", msgId: node.id });
       return this.json({ ok: true, userMsgId: node.id });
     } catch (e: any) {
+      this.tasks.delete(s.id);
+      this.broadcast("failed", { sid: s.id, msgId: null, detail: e?.message ?? String(e) });
       return this.fail(e, 500);
     }
   }
@@ -923,8 +945,8 @@ export class Server {
   // static files (embedded)
   // ===================================================================
 
-  private static(path: string): Response {
-    const { indexHtml, styleCss, appJs, markedJs, purifyJs, hljsJs, hljsCss, faviconPng } = assets;
+  private async serveStatic(path: string): Promise<Response> {
+    const { indexHtml, styleCss, appJs, markedJs, purifyJs, hljsJs, hljsCss, faviconPath } = assets;
     let body = "";
     let type = "text/html; charset=utf-8";
     switch (path) {
@@ -957,7 +979,7 @@ export class Server {
         type = "text/css; charset=utf-8";
         break;
       case "/favicon.png":
-        return new Response(faviconPng, { headers: { "Content-Type": "image/png" } });
+        return new Response(await Bun.file(faviconPath).arrayBuffer(), { headers: { "Content-Type": "image/png" } });
       default:
         body = indexHtml;
     }
@@ -1032,25 +1054,27 @@ function engineEntriesBefore(path: Msg[], uptoId: string): { role: string; conte
   return engineEntries(path.slice(0, idx));
 }
 
-// assets — embedded at build time (populated by build script; dev mode reads from disk)
-import { readFileSync, existsSync } from "node:fs";
-const devRoot = new URL("../../", import.meta.url).pathname;
-function readAsset(rel: string, binary = false): any {
-  const p = join(devRoot, rel);
-  if (existsSync(p)) {
-    return binary ? readFileSync(p) : readFileSync(p, "utf8");
-  }
-  return binary ? new Uint8Array() : "";
-}
-const _uiDir = "src/ui";
-const _vendor = "src/ui/vendor";
+// assets — embedded into the bundle at BUILD time. Text imports become string
+// constants inside the compiled executable; `type: "file"` embeds the PNG and
+// resolves to a readable virtual path at runtime. (The previous version read
+// these files from disk via import.meta.url — inside the compiled exe those
+// paths don't exist, so the app window got a blank page with zero JS. That was
+// the "exe doesn't work" bug.)
+import indexHtml from "../ui/index.html" with { type: "text" };
+import styleCss from "../ui/style.css" with { type: "text" };
+import appJs from "../ui/app.bundle.js" with { type: "text" };
+import markedJs from "../ui/vendor/marked.min.js" with { type: "text" };
+import purifyJs from "../ui/vendor/purify.min.js" with { type: "text" };
+import hljsJs from "../ui/vendor/highlight.min.js" with { type: "text" };
+import hljsCss from "../ui/vendor/highlight-theme.css" with { type: "text" };
+import faviconPath from "../../assets/shuggle_32.png" with { type: "file" };
 export const assets = {
-  indexHtml: readAsset(`${_uiDir}/index.html`),
-  styleCss: readAsset(`${_uiDir}/style.css`),
-  appJs: readAsset(`${_uiDir}/app.bundle.js`),
-  markedJs: readAsset(`${_vendor}/marked.min.js`),
-  purifyJs: readAsset(`${_vendor}/purify.min.js`),
-  hljsJs: readAsset(`${_vendor}/highlight.min.js`),
-  hljsCss: readAsset(`${_vendor}/highlight-theme.css`),
-  faviconPng: readAsset("assets/shuggle_32.png", true),
+  indexHtml,
+  styleCss,
+  appJs,
+  markedJs,
+  purifyJs,
+  hljsJs,
+  hljsCss,
+  faviconPath,
 };

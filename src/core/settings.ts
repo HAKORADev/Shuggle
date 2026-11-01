@@ -136,7 +136,7 @@ export function defaultSettings(): GlobalSettings {
     aboutYou: "",
     language: { mode: "auto", code: "" },
     skillsEnabled: false,
-    skills: [], // populated on first load by clampSettings via sanitizeSkills
+    skills: defaultSkills(), // starter skills ship enabled-capable and editable
     afkMinutes: 3,
     searchEnabled: false,
     searchMaxQueries: 3,

@@ -18,3 +18,18 @@ The whole thing, for the first time:
 - Dual-chat compare mode with per-side or broadcast messages.
 - CLI: `shuggle cli` for real conversations in the terminal, `shuggle chat "..."` for one-shot asks — same account, same history.
 - LAN mode: `.bat`/`.sh` launchers open Shuggle to your local network so anyone on your Wi-Fi can use it in their browser.
+
+## v0.5.0 — alpha refresh (build fixes + live-fire hardening)
+
+Fixes from the first real-machine test round:
+
+- **The exe serves a real UI now** — the app window was blank because assets were probed on disk from inside the compiled binary (those paths only exist in dev). Everything is embedded at build time now, and CI smoke-tests it: the artifact can never ship a blank window again.
+- **CLI that actually runs** — first-run account creation happens right in the terminal; `shuggle cli` and `shuggle chat` attach to the running app instead of spawning a second brain; `/use`, `/rename`, `/pin` and friends really talk to the API now. Windows gets a proper `Shuggle CLI.bat`.
+- **Engine lifecycle hardened** — a boot in flight can no longer be killed by the previous session's goodbye (the race that flipped the engine to "resting" one second after starting); a failed start now lands in an honest error state instead of "booting" forever.
+- **Replay contamination fixed** — generation events are tagged with the command version they belong to; the log stream re-serves old turns on every reconnect and those stale replies used to masquerade as answers to *new* messages.
+- **Memory tools actually reach the engine** — the create/edit/delete/list/list_deleted/undo switch existed in settings but was never sent; the mem echo can no longer truncate your real memories; vision + memory knobs are baked into engine boots and patchable live.
+- **Windows artifact is Windows-only** — no more `.sh` files in the zip; CI trigger repaired (`[main]`), UI-serving smoke tests on both platforms.
+- **Links stay inside the app when you ask** — the in-app viewer setting is now real, with an honest "open in browser" escape hatch for sites that refuse framing.
+- **Compare mode got its broadcast** — one message now goes to both chats side by side.
+- **Sharper binaries** — the executable ships UPX-compressed (~90 MB → ~33 MB) and verified running after compression.
+- Window shell: isolated browser profile by default (your Edge data only when you switch it on), no first-run popups, favicon-carried taskbar icon.

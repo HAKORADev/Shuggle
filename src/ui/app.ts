@@ -581,17 +581,29 @@ async function send(): Promise<void> {
   app.sending = true;
   setSendState();
   try {
-    const r = await api("POST", `/api/sessions/${app.currentMeta.id}/send`, {
+    const payload = {
       text,
       attachments: app.attachments,
       media: app.media.map((m) => ({ name: m.name, kind: m.kind, dataB64: m.dataB64 })),
-    });
+    };
+    const r = await api("POST", `/api/sessions/${app.currentMeta.id}/send`, payload);
+    app.generating.add(app.currentMeta.id);
+    // Compare mode: one message goes to BOTH chats — same words, different
+    // settings/system prompts/tokens, side by side.
+    if (app.compareOpen && app.compareId) {
+      try {
+        await api("POST", `/api/sessions/${app.compareId}/send`, payload);
+        app.generating.add(app.compareId);
+        renderCompare();
+      } catch {
+        /* the other chat may be busy — it stays usable on its own */
+      }
+    }
     input.value = "";
     autosize();
     app.attachments = [];
     app.media = [];
     renderAttachments();
-    app.generating.add(app.currentMeta.id);
     await refreshSessions();
     await openSession(app.currentMeta.id);
   } catch (e: any) {
@@ -776,12 +788,17 @@ function connectStream(): void {
           await openSession(data.sid);
           await refreshSessions();
         }
+        if (app.compareOpen && data.sid === app.compareId) {
+          await refreshSessions();
+          renderCompare();
+        }
         break;
       }
       case "failed": {
         app.generating.delete(data.sid);
         toast(data.detail ?? "The reply failed", "error");
         if (data.sid === app.currentMeta?.id) await openSession(data.sid);
+        if (app.compareOpen && data.sid === app.compareId) renderCompare();
         break;
       }
       case "search": {
@@ -1785,6 +1802,20 @@ Linux:    ./shuggle-lan.sh</pre>
   window.addEventListener("beforeunload", () => {
     navigator.sendBeacon?.("/api/app/shutdown");
   });
+
+  // Link handling — "open links inside the app" (Settings → Interface) opens
+  // them in an in-app viewer; otherwise they go to the real browser.
+  document.addEventListener("click", (e) => {
+    const a = (e.target as HTMLElement)?.closest?.("a[href]") as HTMLAnchorElement | null;
+    if (!a) return;
+    const href = a.getAttribute("href") ?? "";
+    if (!href || href.startsWith("#") || href.startsWith("javascript:")) return;
+    if (!app.settings?.openLinksInApp) return; // default browser behavior
+    const insideThread = !!a.closest("#thread, .modal-body, .compare-pane");
+    if (!insideThread) return;
+    e.preventDefault();
+    openLinkViewer(href);
+  });
 }
 
 async function newChat(focus: boolean): Promise<void> {
@@ -1792,6 +1823,32 @@ async function newChat(focus: boolean): Promise<void> {
   await refreshSessions();
   await openSession(r.id);
   if (focus) ($("#input") as HTMLTextAreaElement).focus();
+}
+
+/** In-app link viewer — a modal with the page in an iframe, plus an honest
+ *  escape hatch: some sites refuse framing, so the real browser is one click away. */
+function openLinkViewer(url: string): void {
+  const short = url.length > 60 ? url.slice(0, 60) + "…" : url;
+  const open = el("button", "btn", "Open in browser");
+  open.onclick = () => {
+    window.open(url, "_blank", "noopener");
+    closeModal();
+  };
+  const m = modal(esc(short),
+    `<div class="link-viewer"><iframe sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+     <div class="link-note">Some sites refuse to load inside an app window. If this stays blank, open it in your browser.</div></div>`,
+    { wide: true, foot: [open] });
+  const iframe = m.querySelector("iframe") as HTMLIFrameElement;
+  iframe.src = url;
+  const box = m.querySelector(".link-viewer") as HTMLElement;
+  box.style.display = "flex";
+  box.style.flexDirection = "column";
+  box.style.gap = "10px";
+  iframe.style.width = "100%";
+  iframe.style.height = "66vh";
+  iframe.style.border = "0";
+  iframe.style.borderRadius = "10px";
+  iframe.style.background = "#fff";
 }
 
 // ------------------------------------------------------------------ boot

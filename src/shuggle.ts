@@ -11,6 +11,7 @@
 // argv dispatch happens FIRST — nothing else runs before it.
 
 import { join, dirname } from "node:path";
+import { readFileSync, writeFileSync, rmSync } from "node:fs";
 import { VERSION } from "./version.ts";
 import { printBanner } from "./banner.ts";
 import { Server } from "./server/server.ts";
@@ -62,6 +63,13 @@ async function main(): Promise<void> {
         fetch: (req) => server.handle(req),
       });
       server.startPings();
+      // Announce the port so `shuggle cli` / `shuggle chat` attach to THIS
+      // server instead of spawning a second one over the same data.
+      try {
+        writeFileSync(join(dataDir(), "server.json"), JSON.stringify({ port, pid: process.pid }));
+      } catch {
+        /* CLI will just start its own */
+      }
       printBanner();
       const urls = lan ? lanUrls(port) : localUrls(port);
       console.log("");
@@ -73,10 +81,25 @@ async function main(): Promise<void> {
       for (const u of urls) console.log(`    ${u}`);
       console.log("");
       if (!isServe && !lan) {
-        openAppWindow(urls[0]);
+        // The window shell reads this hint before login (settings are sealed
+        // until then): useEdgeData=false → isolated profile, never touching
+        // the user's browser data; true → share the real Edge profile.
+        let useEdgeData = false;
+        try {
+          const prefs = JSON.parse(readFileSync(join(dataDir(), "ui-prefs.json"), "utf8"));
+          useEdgeData = !!prefs.useEdgeData;
+        } catch {
+          /* first run — isolated by default */
+        }
+        openAppWindow(urls[0], { useEdgeData, userDataDir: join(dataDir(), "window-profile") });
       }
       const stop = async () => {
         await server.context.saveNow();
+        try {
+          rmSync(join(dataDir(), "server.json"), { force: true });
+        } catch {
+          /* already gone */
+        }
         process.exit(0);
       };
       process.on("SIGINT", stop);

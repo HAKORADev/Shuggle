@@ -75,17 +75,24 @@ export class EngineSlot {
   private generating = new Set<string>(); // sids with in-flight generation
   private visionState: VisionState = "unknown";
   private visionDetail: string | null = null;
+  /** Live engine knobs — baked at boot and patchable while running. */
+  memoryTools = false;
+  visionBoot = { enabled: false, maxFrames: 8, frameSeconds: 2, mediaBudget: 8000 };
   private bootGraceUntil = 0;
   private pushedAt = 0;
   private lastSseAt = 0;
   private recovering = false;
   private lastCmdSentAt = 0;
+  /** Highest command version sent per session — generation events tagged with
+   *  a LOWER v are replays of earlier turns (the kernel log re-serves the whole
+   *  session on every connect) and must never fill the current task. */
+  private activeCmdV: Record<string, number> = {};
   /** True right after a push: every terminal event seen in the stream is a
    *  replay of the previous session until a booting event arrives LATE
    *  (replays land instantly; a fresh session takes minutes to start). */
   private awaitingFreshBoot = false;
 
-  constructor(opts: { username: string; secret: string; profile: string; contextTokens: number; afkSeconds: number; events: EventEmitter }) {
+  constructor(opts: { username: string; secret: string; profile: string; contextTokens: number; afkSeconds: number; memoryTools?: boolean; vision?: { enabled: boolean; maxFrames: number; frameSeconds: number; mediaTokenBudget: number }; events: EventEmitter }) {
     this.username = opts.username;
     this.secret = opts.secret;
     this.profile = opts.profile;
@@ -93,6 +100,10 @@ export class EngineSlot {
     this.slug = `shuggle-engine-${this.ns}`;
     this.contextTokens = opts.contextTokens;
     this.afkSeconds = opts.afkSeconds;
+    this.memoryTools = opts.memoryTools ?? false;
+    if (opts.vision) {
+      this.visionBoot = { enabled: opts.vision.enabled, maxFrames: opts.vision.maxFrames, frameSeconds: opts.vision.frameSeconds, mediaBudget: opts.vision.mediaTokenBudget };
+    }
     this.events = opts.events;
     this.kaggle = new Kaggle(opts.secret);
   }
@@ -195,39 +206,77 @@ export class EngineSlot {
     return false;
   }
 
+  /** True while a boot is actually in flight — any COMPLETE/ERROR seen by
+   *  timers or the log loop belongs to the PREVIOUS session, so terminal
+   *  lifecycle decisions must wait until the fresh boot resolves. */
+  private lifecycleBlocked(): boolean {
+    return this.state === "booting" || this.state === "seeding";
+  }
+
   private async pushAndAttach(record: TokenRecord, bootLabel: string): Promise<void> {
     this.setState("booting", bootLabel);
     this.bootStartedAt = Date.now();
-    await this.ensureDatasets();
-    if (!(await this.modelDatasetReady())) {
-      await this.seedModel(record);
+    try {
+      await this.ensureDatasets();
+      if (!(await this.modelDatasetReady())) {
+        await this.seedModel(record);
+      }
+      const script = engineScript({
+        bearer: this.secret,
+        owner: this.username,
+        profile: this.profile,
+        contextTokens: this.contextTokens,
+        afkSeconds: this.afkSeconds,
+        memoryTools: this.memoryTools,
+        vision: this.visionBoot,
+      });
+      const res = await this.kaggle.pushKernel({
+        owner: this.username,
+        slug: this.slug,
+        title: `Shuggle Engine ${this.ns}`,
+        script,
+        run: true,
+        gpu: true,
+        internet: true,
+        machineShape: "NvidiaTeslaT4",
+        datasetSources: [`${this.username}/shuggle-model`],
+        timeoutSeconds: 3600 * 6,
+      });
+      this.slug = res.slug;
+      this.resetRuntime();
+      this.pushedAt = Date.now();
+      this.bootGraceUntil = Date.now() + 900_000;
+      this.lastSseAt = Date.now();
+      this.awaitingFreshBoot = true;
+      await this.attachStreams();
+      // Boot watchdog: if the fresh session never announces itself (its events
+      // lost to a rate-limit storm, or it died before any log line), resolve
+      // the boot honestly instead of hanging on "booting" forever.
+      void (async () => {
+        const deadline = Date.now() + 25 * 60_000;
+        while (Date.now() < deadline) {
+          await sleep(30_000);
+          if (this.state !== "booting" && this.state !== "seeding") return;
+          try {
+            const st = await this.kaggle.kernelStatus(this.username, this.slug);
+            if (st.status === "ERROR" || st.status === "COMPLETE") {
+              this.awaitingFreshBoot = false;
+              this.lastError = st.failureMessage ?? "the engine stopped while starting";
+              this.setState("error", "The engine could not finish starting — it will try again on your next message");
+              this.stopTimers();
+              return;
+            }
+          } catch {
+            /* transient — keep waiting until the deadline */
+          }
+        }
+      })();
+    } catch (e: any) {
+      // A failed push must never leave the slot stuck on "booting" forever.
+      this.lastError = String(e?.message ?? e);
+      this.setState("error", "The engine could not start — it will try again on your next message");
+      throw e;
     }
-    const script = engineScript({
-      bearer: this.secret,
-      owner: this.username,
-      profile: this.profile,
-      contextTokens: this.contextTokens,
-      afkSeconds: this.afkSeconds,
-    });
-    const res = await this.kaggle.pushKernel({
-      owner: this.username,
-      slug: this.slug,
-      title: `Shuggle Engine ${this.ns}`,
-      script,
-      run: true,
-      gpu: true,
-      internet: true,
-      machineShape: "NvidiaTeslaT4",
-      datasetSources: [`${this.username}/shuggle-model`],
-      timeoutSeconds: 3600 * 6,
-    });
-    this.slug = res.slug;
-    this.resetRuntime();
-    this.pushedAt = Date.now();
-    this.bootGraceUntil = Date.now() + 900_000;
-    this.lastSseAt = Date.now();
-    this.awaitingFreshBoot = true;
-    await this.attachStreams();
   }
 
   private resetRuntime(): void {
@@ -305,12 +354,12 @@ export class EngineSlot {
     this.stopTimers();
     // status watcher: detects external death + zombie sessions
     this.statusTimer = setInterval(async () => {
-      if (this.recovering) return;
+      if (this.recovering || this.kaggle.cooling()) return;
       if (this.state === "generating" || this.state === "ready" || this.state === "waking" || this.state === "booting") {
         try {
           const st = await this.kaggle.kernelStatus(this.username, this.slug);
           if (st.status === "COMPLETE" || st.status === "ERROR" || st.status === "CANCEL_ACKNOWLEDGED") {
-            if (this.awaitingFreshBoot) return; // status lag — still reporting the previous session
+            if (this.awaitingFreshBoot || this.lifecycleBlocked()) return; // boot in flight or status lag — this is the old session
             this.setState(st.status === "ERROR" ? "error" : "sleeping", st.status === "ERROR" ? "The engine hit a problem" : "Your engine is resting");
             if (st.status === "ERROR") this.lastError = st.failureMessage ?? "engine error";
             this.stopTimers();
@@ -336,6 +385,7 @@ export class EngineSlot {
     let lastOutbox = "";
     this.outboxTimer = setInterval(async () => {
       if (this.state === "sleeping" || this.state === "idle") return;
+      if (this.kaggle.cooling()) return;
       try {
         const text = await this.kaggle.datasetDownloadText(this.username, `shuggle-outbox-${this.ns}`, "state.json");
         if (!text || text === lastOutbox) return;
@@ -383,6 +433,10 @@ export class EngineSlot {
       // They carry DATA (chunks, done, memory) but must not drive the
       // lifecycle state — a replayed "sleeping" from the previous session
       // would otherwise kill the relay for a session that is still queued.
+      if (this.kaggle.cooling()) {
+        await sleep(10_000);
+        continue;
+      }
       const connAt = Date.now();
       try {
         for await (const raw of this.kaggle.logStream(this.username, this.slug, signal)) {
@@ -412,7 +466,7 @@ export class EngineSlot {
       try {
         const st = await this.kaggle.kernelStatus(this.username, this.slug);
         const alive = st.status === "RUNNING" || st.status === "QUEUED" || st.status === "INITIALIZING";
-        if (!alive && !this.awaitingFreshBoot) {
+        if (!alive && !this.awaitingFreshBoot && !this.lifecycleBlocked()) {
           if (st.status === "COMPLETE") this.setState("sleeping", "Your engine is resting");
           if (st.status === "ERROR") {
             this.setState("error", "The engine hit a problem");
@@ -467,19 +521,25 @@ export class EngineSlot {
         this.emit("config", j.patch ?? {});
         break;
       case "chunk": {
+        if (this.isStaleGenEvent(j)) break;
         if (j.k === "text" || j.k === "think") {
           this.emit("chunk", { sid: j.sid, seq: j.seq, kind: j.k, text: j.t });
         }
         break;
       }
-      case "reclass":
+      case "reclass": {
+        if (this.isStaleGenEvent(j)) break;
         this.emit("reclass", { sid: j.sid });
         break;
-      case "gen-start":
+      }
+      case "gen-start": {
+        if (this.isStaleGenEvent(j)) break;
         this.generating.add(j.sid);
         this.setState("generating");
         break;
-      case "done":
+      }
+      case "done": {
+        if (this.isStaleGenEvent(j)) break;
         this.generating.delete(j.sid);
         if (this.generating.size === 0) this.setState("ready");
         this.emit("done", {
@@ -494,11 +554,14 @@ export class EngineSlot {
           memResults: j.mem_results ?? null,
         });
         break;
-      case "failed":
+      }
+      case "failed": {
+        if (this.isStaleGenEvent(j)) break;
         this.generating.delete(j.sid);
         if (this.generating.size === 0) this.setState("ready");
         this.emit("failed", { sid: j.sid, detail: j.d });
         break;
+      }
       case "hash":
         this.seenSessionHash[j.sid] = j.hash;
         this.emit("session-hash", { sid: j.sid, hash: j.hash });
@@ -514,10 +577,11 @@ export class EngineSlot {
       case "store-saved":
         break;
       case "search":
+        if (this.isStaleGenEvent(j)) break;
         this.emit("search", { sid: j.sid, phase: j.phase, data: j.data ?? null });
         break;
       case "sleeping": {
-        if (!live || this.awaitingFreshBoot) break; // replay from a previous session
+        if (!live || this.awaitingFreshBoot || this.lifecycleBlocked()) break; // replay from a previous session / boot in flight
         // The log replays past sessions — confirm with the live status before
         // believing an afk-stop.
         void (async () => {
@@ -550,12 +614,23 @@ export class EngineSlot {
 
   /** Push a command into the engine's inbox. Media files ride in the same
    *  dataset version as cmd.json — the engine fetches them by name. */
-  private async sendCmd(cmd: Record<string, any>, files: Record<string, string | Uint8Array> = {}): Promise<void> {
+  private async sendCmd(cmd: Record<string, any>, files: Record<string, string | Uint8Array> = {}): Promise<number> {
     cmd.v = this.nextV();
     cmd.profile = this.profile;
     const payload: Record<string, string | Uint8Array> = { "cmd.json": JSON.stringify(cmd), ...files };
     this.lastCmdSentAt = Date.now();
     await this.kaggle.datasetUpsert(this.username, `shuggle-inbox-${this.ns}`, "Shuggle Inbox", payload, `v${cmd.v}`);
+    return cmd.v;
+  }
+
+  /** True when a generation event belongs to an older command than the one
+   *  the app last sent for this session (log-stream replay contamination). */
+  private isStaleGenEvent(j: any): boolean {
+    if (!j?.sid) return false;
+    const cur = this.activeCmdV[j.sid];
+    if (cur === undefined) return false;
+    if (typeof j.v !== "number") return false; // legacy engine — cannot judge
+    return j.v < cur;
   }
 
   async wakeAndSend(turn: ChatTurn): Promise<void> {
@@ -564,8 +639,9 @@ export class EngineSlot {
     }
     if (this.seenSessionHash[turn.sid] === undefined) {
       // New session for this engine — create it there, then the delta applies.
-      await this.sendCmd({ type: "new_session", sid: turn.sid });
+      const vNew = await this.sendCmd({ type: "new_session", sid: turn.sid });
       this.seenSessionHash[turn.sid] = "";
+      this.activeCmdV[turn.sid] = vNew;
     }
     // Media files ride along in this inbox version.
     const files: Record<string, string | Uint8Array> = {};
@@ -576,7 +652,7 @@ export class EngineSlot {
         mediaMeta.push({ name: m.name, kind: m.kind, file: m.file });
       }
     }
-    await this.sendCmd(
+    const vSent = await this.sendCmd(
       {
         type: "chat",
         sid: turn.sid,
@@ -596,6 +672,7 @@ export class EngineSlot {
       },
       files,
     );
+    this.activeCmdV[turn.sid] = vSent;
   }
 
   async resyncPath(sid: string, history: { role: string; content: string; mid?: string }[]): Promise<void> {
@@ -607,13 +684,18 @@ export class EngineSlot {
     await this.sendCmd({ type: "mem_set", text, hash, deleted: deleted ?? [] });
   }
 
-  async memoryHashRequest(): Promise<string> {
-    await this.sendCmd({ type: "mem_get" });
-    return this.memHash;
-  }
-
-  /** Live engine configuration — applied on the next loop tick, NO restart. */
-  async configure(patch: { afkSeconds?: number; vision?: { enabled: boolean; maxFrames?: number; frameSeconds?: number; mediaTokenBudget?: number } }): Promise<void> {
+  /** Live engine configuration — applied on the next loop tick, NO restart.
+   *  Only a context-size change and engine upgrades ever need a real boot. */
+  async configure(patch: { afkSeconds?: number; memoryTools?: boolean; vision?: { enabled: boolean; maxFrames?: number; frameSeconds?: number; mediaTokenBudget?: number } }): Promise<void> {
+    if (patch.memoryTools !== undefined) this.memoryTools = patch.memoryTools;
+    if (patch.vision) {
+      this.visionBoot = {
+        enabled: patch.vision.enabled ?? this.visionBoot.enabled,
+        maxFrames: patch.vision.maxFrames ?? this.visionBoot.maxFrames,
+        frameSeconds: patch.vision.frameSeconds ?? this.visionBoot.frameSeconds,
+        mediaBudget: patch.vision.mediaTokenBudget ?? this.visionBoot.mediaBudget,
+      };
+    }
     if (this.state === "idle" || this.state === "sleeping" || this.state === "error") return; // applied at boot
     await this.sendCmd({ type: "config", patch }).catch(() => {});
   }
