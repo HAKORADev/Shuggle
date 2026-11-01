@@ -140,28 +140,28 @@ async function main(): Promise<void> {
     }
     case "cli": {
       const { initPiped } = await import("./cli/bridge.ts");
-      initPiped();
+      await initPiped();
       const { runInteractiveCli } = await import("./cli/cli.ts");
       await runInteractiveCli({ dataDir: dataDir() });
       break;
     }
     case "chat": {
       const { initPiped } = await import("./cli/bridge.ts");
-      initPiped();
+      await initPiped();
       const { runOneLine } = await import("./cli/oneline.ts");
       await runOneLine({ dataDir: dataDir(), args: args.slice(1) });
       break;
     }
     case "tokens": {
       const { initPiped } = await import("./cli/bridge.ts");
-      initPiped();
+      await initPiped();
       const { runTokensCommand } = await import("./cli/tokens_cmd.ts");
       await runTokensCommand({ dataDir: dataDir(), args: args.slice(1) });
       break;
     }
     case "status": {
       const { initPiped } = await import("./cli/bridge.ts");
-      initPiped();
+      await initPiped();
       const { runStatus } = await import("./cli/oneline.ts");
       await runStatus({ dataDir: dataDir() });
       break;

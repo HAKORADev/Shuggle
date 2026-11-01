@@ -168,6 +168,8 @@ export class Server {
         const task = this.taskFor(ev.sid);
         if (!task) break;
         const s = this.app.sessions.sessions[task.sid];
+        // surface the failure even when no chunk ever arrived
+        this.ensureAssistantNode(task);
         if (s && task.assistantMsgId && s.nodes[task.assistantMsgId]) {
           s.nodes[task.assistantMsgId].error = humanError(ev.detail);
         }
@@ -293,6 +295,9 @@ export class Server {
       content = outbox.content;
       thinking = outbox.thinking ?? null;
     }
+    // A turn can finish without a single streamed chunk reaching us (log
+    // stream hiccup, boot-edge races). The reply must still appear.
+    this.ensureAssistantNode(task);
     if (task.assistantMsgId && s.nodes[task.assistantMsgId]) {
       const n = s.nodes[task.assistantMsgId];
       n.content = content;

@@ -635,7 +635,10 @@ def generate(sid, messages, settings, thinking, search_cfg):
     search_brief = None
     search_queries = []
     if search_cfg and search_cfg.get("enabled"):
-        search_brief, search_queries, messages = do_search(messages, search_cfg, settings)
+        search_brief, search_queries = do_search(messages, search_cfg, settings)
+        if search_brief:
+            messages = [dict(m) for m in messages]
+            messages[0]["content"] = (messages[0].get("content", "") + "\n\n" + search_brief).strip()
     stream = llm.create_chat_completion(
         messages=messages,
         temperature=float(settings.get("temperature", 0.7)),
@@ -765,14 +768,12 @@ def do_search(messages, search_cfg, settings):
     brief = dres["choices"][0]["message"]["content"].strip()
     if brief == "NO_RESULTS" or not brief:
         slog({"ev": "search", "phase": "empty"})
-        return None, queries, messages
+        return None, queries
     slog({"ev": "search", "phase": "brief", "data": brief[:120]})
-    new_messages = list(messages)
-    new_messages.insert(len(new_messages) - 1, {
-        "role": "system",
-        "content": "Fresh web research brief for the user's request (sources in parentheses):\n" + brief,
-    })
-    return brief, queries, new_messages
+    # returned as TEXT — the caller merges it into the single leading system
+    # message (the chat template forbids a second system message mid-list)
+    brief_text = ("Fresh web research brief for the user's request (sources in parentheses):\n" + brief)
+    return brief_text, queries
 
 # ------------------------------------------------------- memory ops (v3) ----
 MEM_CAP = 10000
@@ -1048,7 +1049,10 @@ def handle_chat(cmd):
             mem_state()["text"] = cmd["memory_text"]
             mem_state()["hash"] = cmd["memory_hash"]
 
-    msgs = [{"role": "system", "content": cmd.get("system", "")}]
+    # ONE system message, always first: the model's chat template hard-rejects
+    # any system message that is not the very first (Qwen3.x strict rule), so
+    # skills, memory tools and the memory log merge in as labeled sections.
+    sys_parts = [cmd.get("system", "")]
     skills = cmd.get("skills") or []
     if skills:
         blocks = []
@@ -1060,12 +1064,13 @@ def handle_chat(cmd):
                 b += "Why it exists: " + s["why"] + "\n"
             b += "---\n" + s.get("content", "") + "\n---"
             blocks.append(b)
-        msgs.append({"role": "system", "content": SKILLS_HANDLER_PROMPT + "\n\nThe skills:\n\n" + "\n\n".join(blocks)})
+        sys_parts.append(SKILLS_HANDLER_PROMPT + "\n\nThe skills:\n\n" + "\n\n".join(blocks))
     if bool(CFG.get("memoryTools", False)):
-        msgs.append({"role": "system", "content": MEMORY_TOOLS_PROMPT})
+        sys_parts.append(MEMORY_TOOLS_PROMPT)
         log_lines = mem_state().get("log", [])
         if log_lines:
-            msgs.append({"role": "system", "content": "Memory system results from your last operations:\n" + "\n".join(log_lines[-6:])})
+            sys_parts.append("Memory system results from your last operations:\n" + "\n".join(log_lines[-6:]))
+    msgs = [{"role": "system", "content": "\n\n".join(p for p in sys_parts if p)}]
 
     # build the LLM message list (media attached to the current user turn;
     # older media replaced with honest placeholders once the budget is spent)

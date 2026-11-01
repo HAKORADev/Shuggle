@@ -36,7 +36,7 @@ export async function connectServer(dataDir: string): Promise<Bridge> {
   }
   // 2. start an embedded server (we now hold the lock on a fresh port)
   const { pickFreePort } = await import("../launch.ts");
-  const port = claimed ? claimed.port : await pickFreePort(8690);
+  const port = await pickFreePort(8690);
   await Server.claimLock(dataDir, port, process.pid);
   const server = new Server({
     dataDir,
@@ -110,28 +110,36 @@ export function getRl(): any {
 }
 
 // Piped (non-TTY) input: buffer everything up front, serve lines deterministically.
+// A held-open stdin (GUI launcher, sandbox, `shuggle &`) must never wedge the
+// CLI — the read races a short timer and falls back to interactive mode.
 let pipedLines: string[] | null = null;
+let pipedAvailable = false;
 export function isPiped(): boolean {
   return process.stdin.isTTY !== true;
 }
-export function initPiped(): void {
+export async function initPiped(): Promise<void> {
   if (!isPiped() || pipedLines) return;
-  try {
-    const all = readFileSync(0, "utf8");
-    pipedLines = all.split("\n");
-  } catch {
+  const race = await Promise.race([
+    new Response(Bun.stdin.stream()).text().then((t) => (t === null ? null : t)),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 400)),
+  ]);
+  if (race === null) {
     pipedLines = [];
+    pipedAvailable = false;
+    return;
   }
+  pipedLines = race.split("\n");
+  pipedAvailable = true;
 }
 export function nextPipedLine(): string | null {
-  if (!pipedLines) return null;
+  if (!pipedLines || !pipedAvailable) return null;
   const l = pipedLines.shift();
   return l === undefined ? null : l;
 }
 
 export function promptHidden(question: string): Promise<string> {
   return new Promise((resolve) => {
-    if (isPiped()) {
+    if (isPiped() && pipedAvailable) {
       process.stdout.write(question);
       resolve((nextPipedLine() ?? "").trim());
       return;
