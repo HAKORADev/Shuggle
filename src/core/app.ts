@@ -171,7 +171,6 @@ export class AppContext {
         events: this.events,
       });
       this.slots.set(username, slot);
-      slot.attachRelay();
     }
     return slot;
   }

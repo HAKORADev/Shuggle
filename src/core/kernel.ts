@@ -135,6 +135,8 @@ MEMORY_TOOLS_PROMPT = (
     "asks what you remember, asks you to change or forget a memory, or explicitly "
     "wants the list. Do not create memories for small talk or temporary context.\n"
     "- Keep each memory short and factual (one or two sentences).\n"
+    "- When you emit a block, always emit it COMPLETE in one go: opening fence, "
+    "the JSON, closing fence — never stop mid-block.\n"
     "- You may emit multiple blocks in one reply if needed.\n"
     "- The app strips these blocks before your reply is shown; do not repeat their "
     "content in your visible text.\n"

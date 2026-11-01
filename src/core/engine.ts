@@ -10,6 +10,7 @@
 
 import { Kaggle, sleep } from "./kaggle.ts";
 import { engineScript } from "./kernel.ts";
+import { ENGINE_VERSION } from "../version.ts";
 import { hsh16 } from "./util.ts";
 import { TokenRecord } from "./tokens.ts";
 import { EventEmitter } from "node:events";
@@ -98,6 +99,9 @@ export class EngineSlot {
    *  replay of the previous session until a booting event arrives LATE
    *  (replays land instantly; a fresh session takes minutes to start). */
   private awaitingFreshBoot = false;
+  private sawReadyInLog = false;
+  private adoptedEngineVersion: string | null = null;
+  private upgradedForVersion = false;
 
   constructor(opts: { username: string; secret: string; profile: string; contextTokens: number; afkSeconds: number; memoryTools: boolean; vision: EngineVisionConfig; events: EventEmitter }) {
     this.username = opts.username;
@@ -191,16 +195,21 @@ export class EngineSlot {
   }
 
   private async bootInner(record: TokenRecord, force = false): Promise<void> {
-    // Hard ceiling — a hung boot must never wedge the slot forever.
-    return await Promise.race([
-      this.bootSteps(record, force),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("boot timed out — Kaggle is slow right now, try again")), 10 * 60_000)
-      ).catch((e) => {
-        this.setState("error", "The engine could not start — try again in a minute");
-        throw e;
-      }),
-    ]);
+    // Hard ceiling — a hung boot must never wedge the slot forever. The timer
+    // is CANCELLED when the boot settles: a fire-after-success would kill a
+    // healthy running slot ten minutes later (that was a real bug).
+    let timer: NodeJS.Timeout | undefined;
+    const ceiling = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("boot timed out — Kaggle is slow right now, try again")), 10 * 60_000);
+    });
+    try {
+      return await Promise.race([this.bootSteps(record, force), ceiling]);
+    } catch (e) {
+      this.setState("error", "The engine could not start — try again in a minute");
+      throw e;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private async bootSteps(record: TokenRecord, force = false): Promise<void> {
@@ -209,42 +218,17 @@ export class EngineSlot {
     const st = await this.kaggle.kernelStatus(this.username, this.slug);
     dbg(`boot: kernel status ${st.status}`);
     if (st.status === "RUNNING" && !force) {
-      // A session claims to be alive. Verify it actually produces output —
-      // Kaggle occasionally leaves zombie sessions (RUNNING with no logs)
-      // that would silently queue every new push behind them for hours.
-      const alive = await this.sessionProducesOutput(12_000);
-      if (alive) {
-        this.setState("waking", "Connecting to your engine");
-        this.lastSseAt = Date.now();
-        await this.attachStreams();
-        return;
-      }
-      this.setState("booting", "Clearing a stuck engine session");
-      await this.kaggle.deleteKernel(this.username, this.slug).catch(() => {});
-      await sleep(4_000);
+      // A session claims to be alive. Adopt it — ONE stream connection total
+      // (opening a second stream after a liveness probe starves it: the SSE
+      // endpoint serves one consumer). Liveness is proven by the reader: a
+      // fresh heartbeat plus a ready marker in the log. A dead-but-RUNNING
+      // session is caught by the status watcher within 30s and failed honestly.
+      this.setState("waking", "Connecting to your engine");
+      this.lastSseAt = Date.now();
+      await this.attachStreams();
+      return;
     }
     await this.pushAndAttach(record, force ? "Restarting your engine" : "Starting your engine");
-  }
-
-  /** True if the kernel's live log yields any line within `windowMs`. */
-  private async sessionProducesOutput(windowMs: number): Promise<boolean> {
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), windowMs);
-      try {
-        for await (const raw of this.kaggle.logStream(this.username, this.slug, ctrl.signal)) {
-          if (raw.trim()) {
-            clearTimeout(timer);
-            return true;
-          }
-        }
-      } finally {
-        clearTimeout(timer);
-      }
-    } catch {
-      /* aborted / unavailable */
-    }
-    return false;
   }
 
   private async pushAndAttach(record: TokenRecord, bootLabel: string): Promise<void> {
@@ -292,6 +276,8 @@ export class EngineSlot {
     this.generating.clear();
     this.visionState = "unknown";
     this.visionDetail = null;
+    this.sawReadyInLog = false;
+    this.adoptedEngineVersion = null;
   }
 
   /** One-time model seeding: a CPU-only kernel downloads the model + vision
@@ -352,12 +338,9 @@ export class EngineSlot {
     this.emit("seed", { phase: "done" });
   }
 
-  /** Start the log-stream reader + outbox poller + status watcher. */
-  attachRelay(): void {
-    void this.attachStreams();
-  }
-
-  /** Start the log-stream reader + outbox poller + status watcher. */
+  /** Start the log-stream reader + outbox poller + status watcher. Exactly
+   *  ONE stream per slot may exist — this is only called from boot/adoption
+   *  paths (a second concurrent connection starves: SSE serves one consumer). */
   private async attachStreams(): Promise<void> {
     this.stopTimers();
     // status watcher: detects external death + zombie sessions
@@ -501,9 +484,30 @@ export class EngineSlot {
   private handleEvent(j: any, live: boolean): void {
     switch (j.ev) {
       case "meta":
+        if (j.phase === "booting" && typeof j.engine === "string") {
+          this.adoptedEngineVersion = j.engine;
+          // An adopted session running an older engine script never received
+          // the current one — re-push once so it upgrades (model reloads from
+          // its dataset, no re-download).
+          if (live && this.state === "booting" && j.engine !== String(ENGINE_VERSION) && !this.upgradedForVersion) {
+            this.upgradedForVersion = true;
+            dbg(`adopted engine v${j.engine} is outdated -> re-pushing v${ENGINE_VERSION}`);
+            setTimeout(() => {
+              void this.boot({ id: this.username, secret: this.secret } as TokenRecord, true).catch(() => {});
+            }, 1500);
+          }
+        }
         if (j.phase === "ready") {
-          if (live) this.awaitingFreshBoot = false;
-          this.setState("ready");
+          if (live) {
+            this.awaitingFreshBoot = false;
+            this.sawReadyInLog = true;
+            this.setState("ready");
+          } else if (this.state === "waking") {
+            // replayed ready from the adopted session's log — the model IS
+            // loaded, but wait for a fresh heartbeat to confirm the loop runs
+            this.sawReadyInLog = true;
+            this.setState("booting", "Reconnecting to your engine");
+          }
         } else if (["booting", "installing-deps", "finding-model", "model-copy", "model-copied", "model-local", "loading-model", "model-from-dataset", "model-download-fallback", "store-loaded", "model-ready"].includes(j.phase)) {
           // Only LIVE booting events prove the new session started — replays
           // of the previous session's boot arrive on every reconnect.
@@ -602,8 +606,15 @@ export class EngineSlot {
         })();
         break;
       }
-      case "hb":
+      case "hb": {
+        // timestamped heartbeats (engine v3+) prove CURRENT liveness —
+        // replayed heartbeats carry old timestamps and are ignored
+        if (typeof j.t === "number" && Date.now() / 1000 - j.t < 180) {
+          this.lastSseAt = Date.now();
+          if (this.state === "waking" && this.sawReadyInLog) this.setState("ready");
+        }
         break;
+      }
       case "cmd":
         break;
       case "err":

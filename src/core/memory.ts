@@ -175,6 +175,7 @@ export function extractMemoryOps(output: string): { clean: string; ops: MemoryOp
         /* not valid ops — leave it invisible anyway */
       }
       return "";
-    });
+    })
+    .replace(/```memory(?:-ops)?[\s\S]*$/, ""); // unclosed fence (generation cut mid-emit)
   return { clean, ops };
 }
