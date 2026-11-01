@@ -41,12 +41,22 @@ export function serializeMemory(entries: MemoryEntry[]): string {
 }
 
 export function parseMemoryBlocks(text: string): { name: string; id: string; text: string }[] {
+  // Line-based (mirrors the kernel's python parser exactly — both sides must
+  // agree on the format byte-for-byte).
   const out: { name: string; id: string; text: string }[] = [];
-  const re = /^## (.+?) #([A-Za-z0-9]+)\n([\s\S]*?)(?=^## |\Z)/gm;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text))) {
-    out.push({ name: m[1].trim(), id: m[2], text: m[3].trim() });
+  let cur: { name: string; id: string; text: string } | null = null;
+  for (const line of text.split("\n")) {
+    if (line.startsWith("## ") && line.includes(" #")) {
+      if (cur) out.push(cur);
+      const head = line.slice(3);
+      const idx = head.lastIndexOf(" #");
+      cur = { name: head.slice(0, idx).trim(), id: head.slice(idx + 2).trim(), text: "" };
+    } else if (cur) {
+      cur.text += line + "\n";
+    }
   }
+  if (cur) out.push(cur);
+  for (const b of out) b.text = b.text.trim();
   return out;
 }
 
@@ -138,18 +148,34 @@ export function applyOp(
   }
 }
 
-/** Extract and strip memory op blocks from model output (```memory ... ```). */
+/** Extract and strip memory op blocks from model output. Handles both the
+ *  plain fence (```memory … ```) and the nested-JSON fence the model often
+ *  emits (```memory → ```json … ``` → ```), with or without the -ops suffix. */
 export function extractMemoryOps(output: string): { clean: string; ops: MemoryOp[] } {
   const ops: MemoryOp[] = [];
-  const clean = output.replace(/```memory\n([\s\S]*?)```/g, (_all, body: string) => {
-    try {
-      const parsed = JSON.parse(body.trim());
-      if (Array.isArray(parsed)) ops.push(...parsed);
-      else ops.push(parsed);
-    } catch {
-      /* not valid ops — leave it invisible anyway */
-    }
-    return "";
-  });
+  const clean = output
+    .replace(/```memory(?:-ops)?[ \t]*\n```json\n([\s\S]*?)```[ \t]*\n?```[ \t]*(?:\n|$)/g, (_a, body: string) => {
+      try {
+        const parsed = JSON.parse(String(body).trim());
+        if (Array.isArray(parsed)) ops.push(...parsed);
+        else ops.push(parsed);
+      } catch {
+        /* invisible either way */
+      }
+      return "";
+    })
+    .replace(/```memory(?:-ops)?[ \t]*\n([\s\S]*?)```/g, (_all, body: string) => {
+      let text = String(body).trim();
+      if (text.startsWith("json")) text = text.slice(4).trim();
+      try {
+        const parsed = JSON.parse(text);
+        if (Array.isArray(parsed)) ops.push(...parsed);
+        else ops.push(parsed);
+      } catch {
+        /* not valid ops — leave it invisible anyway */
+      }
+      return "";
+    })
+    .replace(/```memory(?:-ops)?[\s\S]*$/, ""); // unclosed fence (generation cut mid-emit)
   return { clean, ops };
 }

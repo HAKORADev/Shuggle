@@ -23,8 +23,13 @@ export interface EngineConfig {
   bearer: string;
   owner: string;
   profile: string;
+  /** Storage namespace — profile + device signature. The app and the kernel
+   *  MUST agree on it, or the engine reads someone else's datasets. */
+  ns: string;
   contextTokens: number;
   afkSeconds: number;
+  memoryTools: boolean;
+  vision: { enabled: boolean; maxFrames: number; frameSeconds: number; mediaTokenBudget: number };
 }
 
 interface CmdChat {
@@ -70,6 +75,12 @@ import urllib.parse
 import urllib.request
 
 CFG = json.loads(r'''__CONFIG__''')
+if isinstance(CFG.get("vision"), dict):
+    _v = CFG["vision"]
+    CFG["visionEnabled"] = bool(_v.get("enabled", False))
+    CFG["visionMaxFrames"] = int(_v.get("maxFrames", 8))
+    CFG["visionFrameSeconds"] = int(_v.get("frameSeconds", 2))
+    CFG["mediaBudget"] = int(_v.get("mediaTokenBudget", 8000))
 BASE = "https://www.kaggle.com/api/v1"
 OWNER = CFG["owner"]
 PROFILE = CFG["profile"]
@@ -83,7 +94,9 @@ MODEL_DIR = os.path.join(WORK, "model")
 MEDIA_DIR = os.path.join(WORK, "media")
 def _slugns(name):
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:20]
-NS = _slugns(PROFILE)
+# The app owns the namespace (profile + device signature). Fall back to the
+# profile slug only when the app did not send one.
+NS = CFG.get("ns") or _slugns(PROFILE)
 STORE_SLUG = "shuggle-store-" + NS
 INBOX_SLUG = "shuggle-inbox-" + NS
 OUTBOX_SLUG = "shuggle-outbox-" + NS
@@ -127,6 +140,8 @@ MEMORY_TOOLS_PROMPT = (
     "asks what you remember, asks you to change or forget a memory, or explicitly "
     "wants the list. Do not create memories for small talk or temporary context.\n"
     "- Keep each memory short and factual (one or two sentences).\n"
+    "- When you emit a block, always emit it COMPLETE in one go: opening fence, "
+    "the JSON, closing fence — never stop mid-block.\n"
     "- You may emit multiple blocks in one reply if needed.\n"
     "- The app strips these blocks before your reply is shown; do not repeat their "
     "content in your visible text.\n"
@@ -195,32 +210,35 @@ def load_store():
     except Exception as e:
         err("store-load", e)
 
-def save_store(retries=2):
-    try:
-        content = json.dumps(STORE, ensure_ascii=False).encode()
-        j = rpc("blobs.BlobApiService/StartBlobUpload", {
-            "type": "DATASET", "name": "store.json",
-            "contentType": "application/octet-stream",
-            "contentLength": len(content), "lastModifiedEpochSeconds": int(time.time())})
-        req = urllib.request.Request(j["createUrl"], data=content,
-            headers={"Content-Type": "application/octet-stream"}, method="PUT")
-        with urllib.request.urlopen(req, timeout=300) as r:
-            pass
-        rpc("datasets.DatasetApiService/CreateDatasetVersion", {
-            "ownerSlug": OWNER, "datasetSlug": STORE_SLUG,
-            "body": {"files": [{"token": j["token"], "description": "", "columns": []}],
-                     "subtitle": "Shuggle store",
-                     "description": "Shuggle engine storage (sessions, memory). Managed automatically.",
-                     "categoryIds": [], "versionNotes": "t" + str(int(time.time()))}}, 300)
-        slog({"ev": "store-saved"})
-    except urllib.error.HTTPError as e:
-        if e.code == 429 and retries > 0:
-            time.sleep(45)
-            save_store(retries - 1)
-        else:
+def save_store():
+    for attempt in range(3):
+        try:
+            content = json.dumps(STORE, ensure_ascii=False).encode()
+            j = rpc("blobs.BlobApiService/StartBlobUpload", {
+                "type": "DATASET", "name": "store.json",
+                "contentType": "application/octet-stream",
+                "contentLength": len(content), "lastModifiedEpochSeconds": int(time.time())})
+            req = urllib.request.Request(j["createUrl"], data=content,
+                headers={"Content-Type": "application/octet-stream"}, method="PUT")
+            with urllib.request.urlopen(req, timeout=300) as r:
+                pass
+            rpc("datasets.DatasetApiService/CreateDatasetVersion", {
+                "ownerSlug": OWNER, "datasetSlug": STORE_SLUG,
+                "body": {"files": [{"token": j["token"], "description": "", "columns": []}],
+                         "subtitle": "Shuggle store",
+                         "description": "Shuggle engine storage (sessions, memory). Managed automatically.",
+                         "categoryIds": [], "versionNotes": "t" + str(int(time.time()))}}, 300)
+            slog({"ev": "store-saved"})
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
             err("store-save", e)
-    except Exception as e:
-        err("store-save", e)
+            return
+        except Exception as e:
+            err("store-save", e)
+            return
 
 # --------------------------------------------------------------- inbox ----
 SEEN_V = 0
@@ -228,7 +246,19 @@ SEEN_V = 0
 def read_cmd():
     global SEEN_V
     try:
-        raw = _download_bytes(OWNER, INBOX_SLUG, "cmd.json", timeout=30)
+        for _attempt in range(3):
+            try:
+                raw = _download_bytes(OWNER, INBOX_SLUG, "cmd.json", timeout=30)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and _attempt < 2:
+                    time.sleep(4)
+                    continue
+                return None
+            except Exception:
+                return None
+        else:
+            return None
         cmd = json.loads(raw.decode())
         if not isinstance(cmd, dict):
             return None
@@ -448,31 +478,46 @@ def vision_ensure_loaded():
         return False
     if llm is None:
         return False
-    try:
-        import llama_cpp
-        names = ["Qwen3VLChatHandler", "Qwen25VLChatHandler", "Qwen2VLChatHandler", "Llava15ChatHandler"]
-        handler_cls = None
-        picked = None
-        for n in names:
-            if hasattr(llama_cpp, n):
-                handler_cls = getattr(llama_cpp, n)
-                picked = n
-                break
-        if handler_cls is None:
-            VISION["failed"] = "installed engine build has no vision handler"
-            slog({"ev": "vision-unavailable", "d": VISION["failed"]})
-            return False
-        t0 = time.time()
-        VISION["handler"] = handler_cls(VISION["mmproj"])
-        VISION["name"] = picked
-        llm.chat_handler = VISION["handler"]
-        slog({"ev": "vision-ready", "detail": picked, "load_s": round(time.time() - t0, 1)})
-        return True
-    except Exception as e:
-        VISION["failed"] = str(e)[:300]
-        VISION["handler"] = None
-        slog({"ev": "vision-unavailable", "d": VISION["failed"]})
-        return False
+    # Candidates in order of fit for a Qwen3-VL style projector
+    # (clip.projector_type = qwen3vl_merger):
+    #   MTMDChatHandler  — llama.cpp's generic multimodal path (mtmd), the
+    #                      only one that understands qwen3-vl projectors.
+    #   Qwen25VLChatHandler / Qwen2VLChatHandler — explicit Qwen VL formats.
+    #   Llava15ChatHandler — generic LLaVA-style fallback.
+    candidates = [
+        ("MTMDChatHandler", lambda p: _mtmd_handler(p)),
+        ("Qwen3VLChatHandler", lambda p: _cls_handler(p, "Qwen3VLChatHandler")),
+        ("Qwen25VLChatHandler", lambda p: _cls_handler(p, "Qwen25VLChatHandler")),
+        ("Qwen2VLChatHandler", lambda p: _cls_handler(p, "Qwen2VLChatHandler")),
+        ("Llava15ChatHandler", lambda p: _cls_handler(p, "Llava15ChatHandler")),
+    ]
+    errors = []
+    for name, make in candidates:
+        try:
+            t0 = time.time()
+            handler = make(VISION["mmproj"])
+            VISION["handler"] = handler
+            VISION["name"] = name
+            llm.chat_handler = handler
+            slog({"ev": "vision-ready", "detail": name, "load_s": round(time.time() - t0, 1)})
+            return True
+        except Exception as e:
+            errors.append(name + ": " + str(e)[:120])
+    VISION["failed"] = "vision handler unavailable (" + "; ".join(errors) + ")"
+    slog({"ev": "vision-unavailable", "d": VISION["failed"]})
+    return False
+
+
+def _cls_handler(path, cls_name):
+    import llama_cpp
+    cls = getattr(llama_cpp, cls_name)
+    return cls(path)
+
+
+def _mtmd_handler(path):
+    import llama_cpp
+    cls = getattr(llama_cpp, "MTMDChatHandler")
+    return cls(path, verbose=False)
 
 def vision_unload():
     if VISION.get("handler") and llm is not None:
@@ -612,7 +657,10 @@ def generate(sid, messages, settings, thinking, search_cfg):
     search_brief = None
     search_queries = []
     if search_cfg and search_cfg.get("enabled"):
-        search_brief, search_queries, messages = do_search(messages, search_cfg, settings)
+        search_brief, search_queries = do_search(messages, search_cfg, settings)
+        if search_brief:
+            messages = [dict(m) for m in messages]
+            messages[0]["content"] = (messages[0].get("content", "") + "\n\n" + search_brief).strip()
     stream = llm.create_chat_completion(
         messages=messages,
         temperature=float(settings.get("temperature", 0.7)),
@@ -742,14 +790,12 @@ def do_search(messages, search_cfg, settings):
     brief = dres["choices"][0]["message"]["content"].strip()
     if brief == "NO_RESULTS" or not brief:
         slog({"ev": "search", "phase": "empty"})
-        return None, queries, messages
+        return None, queries
     slog({"ev": "search", "phase": "brief", "data": brief[:120]})
-    new_messages = list(messages)
-    new_messages.insert(len(new_messages) - 1, {
-        "role": "system",
-        "content": "Fresh web research brief for the user's request (sources in parentheses):\n" + brief,
-    })
-    return brief, queries, new_messages
+    # returned as TEXT — the caller merges it into the single leading system
+    # message (the chat template forbids a second system message mid-list)
+    brief_text = ("Fresh web research brief for the user's request (sources in parentheses):\n" + brief)
+    return brief_text, queries
 
 # ------------------------------------------------------- memory ops (v3) ----
 MEM_CAP = 10000
@@ -895,13 +941,20 @@ def extract_memory_ops(text):
         if start < 0:
             cleaned_parts.append(rest)
             break
-        end = rest.find(BT, start + len(used))
-        body = rest[start + len(used):end] if end >= 0 else rest[start + len(used):]
         cleaned_parts.append(rest[:start])
-        if end >= 0:
-            rest = rest[end + 3:]
+        after = start + len(used)
+        tail = rest[after:]
+        if tail.lstrip("\n").startswith(BT + "json"):
+            # nested fence: marker, then a json sub-fence, then two closers
+            lead = len(tail) - len(tail.lstrip("\n"))
+            off = after + lead + len(BT) + 4
+            end = rest.find(BT, off)
+            body = rest[off:end] if end >= 0 else rest[off:]
+            rest = rest[end + 3:] if end >= 0 else ""
         else:
-            rest = ""
+            end = rest.find(BT, after)
+            body = rest[after:end] if end >= 0 else rest[after:]
+            rest = rest[end + 3:] if end >= 0 else ""
         body = body.strip()
         if body.startswith("json"):
             body = body[4:].strip()
@@ -1018,7 +1071,10 @@ def handle_chat(cmd):
             mem_state()["text"] = cmd["memory_text"]
             mem_state()["hash"] = cmd["memory_hash"]
 
-    msgs = [{"role": "system", "content": cmd.get("system", "")}]
+    # ONE system message, always first: the model's chat template hard-rejects
+    # any system message that is not the very first (Qwen3.x strict rule), so
+    # skills, memory tools and the memory log merge in as labeled sections.
+    sys_parts = [cmd.get("system", "")]
     skills = cmd.get("skills") or []
     if skills:
         blocks = []
@@ -1030,12 +1086,13 @@ def handle_chat(cmd):
                 b += "Why it exists: " + s["why"] + "\n"
             b += "---\n" + s.get("content", "") + "\n---"
             blocks.append(b)
-        msgs.append({"role": "system", "content": SKILLS_HANDLER_PROMPT + "\n\nThe skills:\n\n" + "\n\n".join(blocks)})
+        sys_parts.append(SKILLS_HANDLER_PROMPT + "\n\nThe skills:\n\n" + "\n\n".join(blocks))
     if bool(CFG.get("memoryTools", False)):
-        msgs.append({"role": "system", "content": MEMORY_TOOLS_PROMPT})
+        sys_parts.append(MEMORY_TOOLS_PROMPT)
         log_lines = mem_state().get("log", [])
         if log_lines:
-            msgs.append({"role": "system", "content": "Memory system results from your last operations:\n" + "\n".join(log_lines[-6:])})
+            sys_parts.append("Memory system results from your last operations:\n" + "\n".join(log_lines[-6:]))
+    msgs = [{"role": "system", "content": "\n\n".join(p for p in sys_parts if p)}]
 
     # build the LLM message list (media attached to the current user turn;
     # older media replaced with honest placeholders once the budget is spent)
@@ -1137,6 +1194,8 @@ def handle_config(cmd):
     patch = cmd.get("patch", {})
     if "afkSeconds" in patch:
         CFG["afkSeconds"] = max(60, int(patch["afkSeconds"]))
+    if "memoryTools" in patch:
+        CFG["memoryTools"] = bool(patch["memoryTools"])
     if "vision" in patch:
         v = patch["vision"] or {}
         CFG["visionEnabled"] = bool(v.get("enabled", False))
@@ -1147,7 +1206,7 @@ def handle_config(cmd):
             vision_unload()
         else:
             VISION["failed"] = None
-    slog({"ev": "config", "patch": {k: CFG.get(k) for k in ("afkSeconds", "visionEnabled", "visionMaxFrames", "visionFrameSeconds", "mediaBudget")}})
+    slog({"ev": "config", "patch": {k: CFG.get(k) for k in ("afkSeconds", "memoryTools", "visionEnabled", "visionMaxFrames", "visionFrameSeconds", "mediaBudget")}})
 
 def dispatch(cmd):
     global SEEN_V, LAST_CMD, LAST_DONE
@@ -1197,14 +1256,19 @@ def main():
     slog({"ev": "meta", "phase": "ready"})
     LAST_CMD = time.time()
     last_hb = time.time()
+    first_cmd_seen = False
     while True:
         cmd = read_cmd()
         if cmd:
+            first_cmd_seen = True
             dispatch(cmd)
         if time.time() - last_hb > 45:
-            slog({"ev": "hb"})
+            # timestamp makes every heartbeat unique — the app dedupes exact
+            # repeats, and a deduped heartbeat would look like silence
+            slog({"ev": "hb", "t": int(time.time())})
             last_hb = time.time()
-        if time.time() - LAST_CMD > int(CFG.get("afkSeconds", 180)):
+        threshold = int(CFG.get("afkSeconds", 180)) if first_cmd_seen else max(int(CFG.get("afkSeconds", 180)), 600)
+        if time.time() - LAST_CMD > threshold:
             save_store()
             slog({"ev": "sleeping", "reason": "afk"})
             outbox_push({"ev": "sleeping", "reason": "afk", "last_done": LAST_DONE})

@@ -5,35 +5,88 @@
 //   shuggle cli          → interactive chat in the terminal
 //   shuggle chat [id] …  → one-line chat
 //   shuggle tokens …     → manage Kaggle tokens
+//   shuggle account      → create this device's account
 //   shuggle status       → engines at a glance
 //   shuggle help         → this list
 //
 // argv dispatch happens FIRST — nothing else runs before it.
+//
+// Windows console model: the exe is compiled as a CONSOLE-subsystem binary
+// (so `shuggle cli` from cmd/PowerShell works with real stdio), and GUI mode
+// hides its console window at startup (no black box behind the app window).
+// Console verbs (cli/chat/tokens/status/help/version) keep the console.
 
 import { join, dirname } from "node:path";
 import { VERSION } from "./version.ts";
 import { printBanner } from "./banner.ts";
 import { Server } from "./server/server.ts";
-import { openAppWindow, pickFreePort, localUrls, lanUrls } from "./launch.ts";
+import { openAppWindow, pickFreePort, localUrls, lanUrls, detachConsole } from "./launch.ts";
 
 function arg(i: number): string | undefined {
   return process.argv[i];
 }
-const args = process.argv.slice(2);
-const hasFlag = (f: string) => args.includes(f);
+
+// Global flags may appear BEFORE the command (launchers pass --data=…), so
+// they are pulled out first. Anything else is positional and belongs to the
+// command — a chat message may legitimately start with a dash.
+const RAW_ARGS = process.argv.slice(2);
+const GLOBAL_FLAG_PREFIXES = ["--data=", "--port="];
+const GLOBAL_FLAGS = ["--lan", "lan", "--version", "-v"];
+const args: string[] = [];
+const globals: string[] = [];
+for (const a of RAW_ARGS) {
+  if (GLOBAL_FLAG_PREFIXES.some((p) => a.startsWith(p)) || GLOBAL_FLAGS.includes(a)) globals.push(a);
+  else args.push(a);
+}
+const hasFlag = (f: string) => globals.includes(f);
 
 function dataDir(): string {
-  const custom = args.find((a) => a.startsWith("--data="))?.split("=")[1];
+  const custom = globals.find((a) => a.startsWith("--data="))?.split("=")[1];
   if (custom) return custom;
   // Next to the executable, like every HAKORA tool: one folder, everything inside.
   const invoked = process.argv[1] ?? "";
   const devMode = invoked.endsWith(".ts") || invoked.endsWith(".js");
-  if (devMode) return join(process.cwd(), "ShuggleData");
-  return join(dirname(process.execPath), "ShuggleData");
+  return devMode ? join(process.cwd(), "ShuggleData") : join(dirname(process.execPath), "ShuggleData");
+}
+
+/** Hide the console window this process inherited (Windows, GUI mode only).
+ *  The exe stays console-subsystem so terminal commands keep real stdio. */
+function hideWindowsConsole(): void {
+  if (process.platform !== "win32") return;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { dlopen, suffix } = require("bun:ffi");
+    const lib = dlopen(`kernel32.${suffix}`, {
+      GetConsoleWindow: { args: [], returns: "ptr" },
+      ShowWindow: { args: ["ptr", "i32"], returns: "i32" },
+      FreeConsole: { args: [], returns: "i32" },
+    });
+    const hwnd = lib.symbols.GetConsoleWindow();
+    if (hwnd) {
+      lib.symbols.ShowWindow(hwnd, 0); // SW_HIDE
+      lib.symbols.FreeConsole(); // release the caller's shell
+    }
+  } catch {
+    /* worst case the console stays visible — never worth crashing over */
+  }
+}
+
+function crashLog(e: unknown): void {
+  try {
+    const dir = dataDir();
+    const fs = require("node:fs");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = join(dir, "last-error.txt");
+    const stamp = new Date().toISOString();
+    fs.appendFileSync(file, `[${stamp}] Shuggle failed to start:\n${e?.stack ?? String(e)}\n\n`);
+    console.error(`\n  Shuggle hit a problem starting up. Details written to:\n  ${file}\n`);
+  } catch {
+    console.error(e);
+  }
 }
 
 function portFromFlags(defaultPort: number): number {
-  const p = args.find((a) => a.startsWith("--port="))?.split("=")[1];
+  const p = globals.find((a) => a.startsWith("--port="))?.split("=")[1];
   return p ? parseInt(p, 10) || defaultPort : defaultPort;
 }
 
@@ -47,7 +100,19 @@ async function main(): Promise<void> {
     case "serve": {
       const isServe = cmd === "serve";
       const lan = hasFlag("--lan") || hasFlag("lan");
+      // Hide the inherited console only for the windowed app experience.
+      // `serve`/LAN mode keeps it — the user is reading URLs from it.
+      if (!isServe && !lan) hideWindowsConsole();
       const port = portFromFlags(lan ? 8680 : await pickFreePort());
+      // One data dir, one server — adopt the running one if it's alive.
+      const lock = await Server.claimLock(dataDir(), port, process.pid);
+      if (lock.existing) {
+        printBanner();
+        console.log(`\n  Shuggle is already running here:`);
+        console.log(`    http://127.0.0.1:${lock.port}\n`);
+        if (!isServe && !lan) openAppWindow(`http://127.0.0.1:${lock.port}`);
+        return;
+      }
       const server = new Server({
         dataDir: dataDir(),
         port,
@@ -59,11 +124,16 @@ async function main(): Promise<void> {
       const srv = Bun.serve({
         port,
         hostname: lan ? "0.0.0.0" : "127.0.0.1",
+        idleTimeout: 255, // long engine operations stream via SSE, but keep room
         fetch: (req) => server.handle(req),
       });
+      const realPort = srv.port || port;
+      // Record the port we actually bound — the lock is what other processes
+      // (CLI, second launch) use to find this server.
+      await Server.claimLock(dataDir(), realPort, process.pid);
       server.startPings();
       printBanner();
-      const urls = lan ? lanUrls(port) : localUrls(port);
+      const urls = lan ? lanUrls(realPort) : localUrls(realPort);
       console.log("");
       if (lan) {
         console.log("  Shuggle is open to your local network:");
@@ -77,36 +147,45 @@ async function main(): Promise<void> {
       }
       const stop = async () => {
         await server.context.saveNow();
+        Server.releaseLock(dataDir(), process.pid);
         process.exit(0);
       };
       process.on("SIGINT", stop);
       process.on("SIGTERM", stop);
+      process.on("exit", () => Server.releaseLock(dataDir(), process.pid));
       break;
     }
     case "cli": {
       const { initPiped } = await import("./cli/bridge.ts");
-      initPiped();
+      await initPiped();
       const { runInteractiveCli } = await import("./cli/cli.ts");
       await runInteractiveCli({ dataDir: dataDir() });
       break;
     }
     case "chat": {
       const { initPiped } = await import("./cli/bridge.ts");
-      initPiped();
+      await initPiped();
       const { runOneLine } = await import("./cli/oneline.ts");
       await runOneLine({ dataDir: dataDir(), args: args.slice(1) });
       break;
     }
     case "tokens": {
       const { initPiped } = await import("./cli/bridge.ts");
-      initPiped();
+      await initPiped();
       const { runTokensCommand } = await import("./cli/tokens_cmd.ts");
       await runTokensCommand({ dataDir: dataDir(), args: args.slice(1) });
       break;
     }
-    case "status": {
+    case "account": {
       const { initPiped } = await import("./cli/bridge.ts");
       initPiped();
+      const { runAccountCommand } = await import("./cli/account_cmd.ts");
+      await runAccountCommand({ dataDir: dataDir() });
+      break;
+    }
+    case "status": {
+      const { initPiped } = await import("./cli/bridge.ts");
+      await initPiped();
       const { runStatus } = await import("./cli/oneline.ts");
       await runStatus({ dataDir: dataDir() });
       break;
@@ -129,6 +208,7 @@ async function main(): Promise<void> {
     shuggle chat 3 "text"      Ask in chat #3
     shuggle tokens add <tok>   Add a Kaggle token
     shuggle tokens list        Show the token pool
+    shuggle account            Create this device's account
     shuggle status             Engines at a glance
     shuggle help               Show this help
 
@@ -139,6 +219,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  console.error(e?.message ?? e);
+  crashLog(e);
   process.exit(1);
 });

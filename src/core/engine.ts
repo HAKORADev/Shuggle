@@ -10,16 +10,30 @@
 
 import { Kaggle, sleep } from "./kaggle.ts";
 import { engineScript } from "./kernel.ts";
+import { ENGINE_VERSION } from "../version.ts";
 import { hsh16 } from "./util.ts";
 import { TokenRecord } from "./tokens.ts";
 import { EventEmitter } from "node:events";
+
+export interface EngineVisionConfig {
+  enabled: boolean;
+  maxFrames: number;
+  frameSeconds: number;
+  mediaTokenBudget: number;
+}
 
 export type SlotState = "idle" | "seeding" | "booting" | "waking" | "ready" | "generating" | "sleeping" | "error";
 export type VisionState = "unknown" | "ready" | "unavailable" | "off";
 
 /** Profile namespace for private kernel/dataset slugs. */
-export function profileNamespace(profile: string): string {
-  return profile.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 20) || "default";
+export function profileNamespace(profile: string, deviceSignature?: string): string {
+  const base = profile.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 20) || "default";
+  // Two devices signed into the same account must NOT share Kaggle storage —
+  // the relay datasets (inbox/outbox/store) are per device, otherwise one
+  // device's commands overwrite the other's.
+  if (!deviceSignature) return base;
+  const sig = hsh16(deviceSignature);
+  return `${base}-${sig}`.slice(0, 40);
 }
 
 export interface SlotEvent {
@@ -52,6 +66,11 @@ export interface ChatTurn {
   mediaForMid?: string | null; // which new message id carries the media
 }
 
+const DEBUG = !!process.env.SHUGGLE_DEBUG;
+function dbg(m: string): void {
+  if (DEBUG) console.error(`[engine ${new Date().toISOString().slice(11, 19)}] ${m}`);
+}
+
 export class EngineSlot {
   readonly username: string;
   private secret: string;
@@ -67,6 +86,8 @@ export class EngineSlot {
   private slug: string;
   private contextTokens: number;
   private afkSeconds: number;
+  private memoryTools: boolean;
+  private vision: EngineVisionConfig;
   private seenSessionHash: Record<string, string> = {};
   private memHash: string = "";
   private probe: { chars_per_token: Record<string, number>; ctx: number } | null = null;
@@ -84,15 +105,20 @@ export class EngineSlot {
    *  replay of the previous session until a booting event arrives LATE
    *  (replays land instantly; a fresh session takes minutes to start). */
   private awaitingFreshBoot = false;
+  private sawReadyInLog = false;
+  private adoptedEngineVersion: string | null = null;
+  private upgradedForVersion = false;
 
-  constructor(opts: { username: string; secret: string; profile: string; contextTokens: number; afkSeconds: number; events: EventEmitter }) {
+  constructor(opts: { username: string; secret: string; profile: string; deviceSignature?: string; contextTokens: number; afkSeconds: number; memoryTools: boolean; vision: EngineVisionConfig; events: EventEmitter }) {
     this.username = opts.username;
     this.secret = opts.secret;
     this.profile = opts.profile;
-    this.ns = profileNamespace(opts.profile);
+    this.ns = profileNamespace(opts.profile, opts.deviceSignature);
     this.slug = `shuggle-engine-${this.ns}`;
     this.contextTokens = opts.contextTokens;
     this.afkSeconds = opts.afkSeconds;
+    this.memoryTools = opts.memoryTools;
+    this.vision = opts.vision;
     this.events = opts.events;
     this.kaggle = new Kaggle(opts.secret);
   }
@@ -135,6 +161,19 @@ export class EngineSlot {
 
   /** Ensure the private relay datasets exist. Cheap (one status check each). */
   private async ensureDatasets(): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.ensureDatasetsOnce();
+        return;
+      } catch (e: any) {
+        if (attempt === 2) throw e;
+        dbg(`ensureDatasets: ${String(e?.message ?? e).slice(0, 80)} — retrying`);
+        await sleep(6000 * (attempt + 1));
+      }
+    }
+  }
+
+  private async ensureDatasetsOnce(): Promise<void> {
     const jobs: [string, string, string][] = [
       [`shuggle-inbox-${this.ns}`, "Shuggle Inbox", "Shuggle command relay for the Shuggle engine. Managed automatically."],
       [`shuggle-outbox-${this.ns}`, "Shuggle Outbox", "Shuggle response relay for the Shuggle engine. Managed automatically."],
@@ -151,48 +190,64 @@ export class EngineSlot {
     return this.kaggle.datasetExists(this.username, "shuggle-model");
   }
 
+  /** The vision projector lives in its own small dataset so a 17 GB model
+   *  never has to be re-uploaded just to add (or fix) the projector. */
+  async visionDatasetReady(): Promise<boolean> {
+    return this.kaggle.datasetExists(this.username, "shuggle-vision");
+  }
+
+  /** Datasets the engine kernel must mount. */
+  private async engineSources(): Promise<string[]> {
+    const sources = [`${this.username}/shuggle-model`];
+    if (await this.visionDatasetReady()) sources.push(`${this.username}/shuggle-vision`);
+    return sources;
+  }
+
   /** Push (or re-push) the engine notebook and wait for it to be ready.
    *  force=true re-pushes even if a session is alive (the Restart button). */
   async boot(record: TokenRecord, force = false): Promise<void> {
-    this.lastError = null;
-    const st = await this.kaggle.kernelStatus(this.username, this.slug);
-    if (st.status === "RUNNING" && !force) {
-      // A session claims to be alive. Verify it actually produces output —
-      // Kaggle occasionally leaves zombie sessions (RUNNING with no logs)
-      // that would silently queue every new push behind them for hours.
-      const alive = await this.sessionProducesOutput(12_000);
-      if (alive) {
-        this.setState("waking", "Connecting to your engine");
-        this.lastSseAt = Date.now();
-        await this.attachStreams();
-        return;
-      }
-      this.setState("booting", "Clearing a stuck engine session");
-      await this.kaggle.deleteKernel(this.username, this.slug).catch(() => {});
-      await sleep(4_000);
-    }
-    await this.pushAndAttach(record, force ? "Restarting your engine" : "Starting your engine");
+    if (this.bootPromise) return this.bootPromise;
+    this.bootPromise = this.bootInner(record, force).finally(() => {
+      this.bootPromise = null;
+    });
+    return this.bootPromise;
   }
 
-  /** True if the kernel's live log yields any line within `windowMs`. */
-  private async sessionProducesOutput(windowMs: number): Promise<boolean> {
+  private async bootInner(record: TokenRecord, force = false): Promise<void> {
+    // Hard ceiling — a hung boot must never wedge the slot forever. The timer
+    // is CANCELLED when the boot settles: a fire-after-success would kill a
+    // healthy running slot ten minutes later (that was a real bug).
+    let timer: NodeJS.Timeout | undefined;
+    const ceiling = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("boot timed out — Kaggle is slow right now, try again")), 10 * 60_000);
+    });
     try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), windowMs);
-      try {
-        for await (const raw of this.kaggle.logStream(this.username, this.slug, ctrl.signal)) {
-          if (raw.trim()) {
-            clearTimeout(timer);
-            return true;
-          }
-        }
-      } finally {
-        clearTimeout(timer);
-      }
-    } catch {
-      /* aborted / unavailable */
+      return await Promise.race([this.bootSteps(record, force), ceiling]);
+    } catch (e) {
+      this.setState("error", "The engine could not start — try again in a minute");
+      throw e;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    return false;
+  }
+
+  private async bootSteps(record: TokenRecord, force = false): Promise<void> {
+    this.lastError = null;
+    dbg(`boot: state=${this.state}`);
+    const st = await this.kaggle.kernelStatus(this.username, this.slug);
+    dbg(`boot: kernel status ${st.status}`);
+    if (st.status === "RUNNING" && !force) {
+      // A session claims to be alive. Adopt it — ONE stream connection total
+      // (opening a second stream after a liveness probe starves it: the SSE
+      // endpoint serves one consumer). Liveness is proven by the reader: a
+      // fresh heartbeat plus a ready marker in the log. A dead-but-RUNNING
+      // session is caught by the status watcher within 30s and failed honestly.
+      this.setState("waking", "Connecting to your engine");
+      this.lastSseAt = Date.now();
+      await this.attachStreams();
+      return;
+    }
+    await this.pushAndAttach(record, force ? "Restarting your engine" : "Starting your engine");
   }
 
   private async pushAndAttach(record: TokenRecord, bootLabel: string): Promise<void> {
@@ -202,13 +257,22 @@ export class EngineSlot {
     if (!(await this.modelDatasetReady())) {
       await this.seedModel(record);
     }
+    // The projector is a separate, tiny download — seed it on its own so the
+    // big model never gets re-uploaded.
+    if (!(await this.visionDatasetReady())) {
+      await this.seedVision(record);
+    }
     const script = engineScript({
       bearer: this.secret,
       owner: this.username,
       profile: this.profile,
+      ns: this.ns,
       contextTokens: this.contextTokens,
       afkSeconds: this.afkSeconds,
+      memoryTools: this.memoryTools,
+      vision: this.vision,
     });
+    dbg("boot: pushing engine kernel");
     const res = await this.kaggle.pushKernel({
       owner: this.username,
       slug: this.slug,
@@ -218,7 +282,7 @@ export class EngineSlot {
       gpu: true,
       internet: true,
       machineShape: "NvidiaTeslaT4",
-      datasetSources: [`${this.username}/shuggle-model`],
+      datasetSources: await this.engineSources(),
       timeoutSeconds: 3600 * 6,
     });
     this.slug = res.slug;
@@ -227,7 +291,9 @@ export class EngineSlot {
     this.bootGraceUntil = Date.now() + 900_000;
     this.lastSseAt = Date.now();
     this.awaitingFreshBoot = true;
+    dbg(`boot: pushed v${res.version}, attaching streams`);
     await this.attachStreams();
+    dbg("boot: complete");
   }
 
   private resetRuntime(): void {
@@ -235,22 +301,62 @@ export class EngineSlot {
     this.generating.clear();
     this.visionState = "unknown";
     this.visionDetail = null;
+    this.sawReadyInLog = false;
+    this.adoptedEngineVersion = null;
   }
 
   /** One-time model seeding: a CPU-only kernel downloads the model + vision
    *  projector once and stores them as a private dataset on this account.
    *  If a seed kernel is already running (app restarted mid-seed), adopt it. */
   private async seedModel(record: TokenRecord): Promise<void> {
-    this.setState("seeding", "Setting up your model (one time only — about 10–20 minutes)");
+    await this.seedInto({
+      label: "model",
+      dataset: "shuggle-model",
+      title: "Shuggle Model",
+      description: "Shuggle engine model storage (weights). Managed automatically.",
+      files: [["Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 16.8]],
+      stateText: "Setting up your model (one time only — about 10–20 minutes)",
+    });
+  }
+
+  /** The vision projector (mmproj) — a small, separate download. */
+  private async seedVision(record: TokenRecord): Promise<void> {
+    await this.seedInto({
+      label: "vision",
+      dataset: "shuggle-vision",
+      title: "Shuggle Vision",
+      description: "Shuggle vision projector for image and video understanding. Managed automatically.",
+      files: [["mmproj-Qwen3.8-27B-Uncensored-F16.gguf", 0.92]],
+      stateText: "Setting up image understanding (one time only — about a minute)",
+    });
+  }
+
+  /** Download a set of files from Hugging Face and store them as a private
+   *  dataset on this account. One dataset per file group so a small file
+   *  never forces a re-upload of a huge one. */
+  private async seedInto(opts: {
+    label: string;
+    dataset: string;
+    title: string;
+    description: string;
+    files: [string, number][];
+    stateText: string;
+  }): Promise<void> {
+    this.setState("seeding", opts.stateText);
     this.emit("seed", { phase: "start" });
-    let slug = "shuggle-model-seed";
+    let slug = `shuggle-${opts.label}-seed`;
     const existing = await this.kaggle.kernelStatus(this.username, slug);
     if (existing.status !== "RUNNING") {
-      const seedScript = SEED_SCRIPT.replace("__BEARER__", this.secret).replace("__OWNER__", this.username);
+      const seedScript = SEED_SCRIPT.replace("__BEARER__", this.secret)
+        .replace("__OWNER__", this.username)
+        .replace("__DATASET__", opts.dataset)
+        .replace("__TITLE__", opts.title)
+        .replace("__DESCRIPTION__", opts.description)
+        .replace("__FILES__", JSON.stringify(opts.files));
       const res = await this.kaggle.pushKernel({
         owner: this.username,
         slug,
-        title: "Shuggle Model Seed",
+        title: `Shuggle ${opts.label === "vision" ? "Vision" : "Model"} Seed`,
         script: seedScript,
         run: true,
         gpu: false,
@@ -295,12 +401,9 @@ export class EngineSlot {
     this.emit("seed", { phase: "done" });
   }
 
-  /** Start the log-stream reader + outbox poller + status watcher. */
-  attachRelay(): void {
-    void this.attachStreams();
-  }
-
-  /** Start the log-stream reader + outbox poller + status watcher. */
+  /** Start the log-stream reader + outbox poller + status watcher. Exactly
+   *  ONE stream per slot may exist — this is only called from boot/adoption
+   *  paths (a second concurrent connection starves: SSE serves one consumer). */
   private async attachStreams(): Promise<void> {
     this.stopTimers();
     // status watcher: detects external death + zombie sessions
@@ -375,7 +478,6 @@ export class EngineSlot {
     this.abortLog?.abort();
     this.abortLog = new AbortController();
     const signal = this.abortLog.signal;
-    let cursor = ""; // dedupe recent lines
     let reconnectDelay = 1000;
     while (!signal.aborted) {
       // Events within the first 20s of a connection are history replays
@@ -389,7 +491,19 @@ export class EngineSlot {
           reconnectDelay = 1000;
           const live = Date.now() - connAt > 20_000;
           for (const line of raw.split("\n")) {
-            const m = line.match(/SHUGGLE (\{.*\})\s*$/);
+            // SSE envelope first: data: {"stream_name":"stdout","data":"SHUGGLE {...}\n"}
+            let payload = line;
+            if (payload.startsWith("data:")) payload = payload.slice(5).trim();
+            if (!payload) continue;
+            try {
+              const env = JSON.parse(payload);
+              if (env && typeof env === "object" && typeof env.data === "string") {
+                payload = env.data;
+              }
+            } catch {
+              /* not an envelope — treat as a plain stdout line */
+            }
+            const m = payload.match(/SHUGGLE (\{.*\})\s*$/);
             if (!m) continue;
             let j: any;
             try {
@@ -398,8 +512,9 @@ export class EngineSlot {
               continue;
             }
             const key = JSON.stringify(j);
-            if (key === cursor) continue;
-            cursor = key;
+            if (this.seenEvents.has(key)) continue;
+            this.seenEvents.add(key);
+            if (this.seenEvents.size > 1500) this.seenEvents = new Set([...this.seenEvents].slice(-800));
             this.lastSseAt = Date.now();
             this.handleEvent(j, live);
           }
@@ -432,9 +547,30 @@ export class EngineSlot {
   private handleEvent(j: any, live: boolean): void {
     switch (j.ev) {
       case "meta":
+        if (j.phase === "booting" && typeof j.engine === "string") {
+          this.adoptedEngineVersion = j.engine;
+          // An adopted session running an older engine script never received
+          // the current one — re-push once so it upgrades (model reloads from
+          // its dataset, no re-download).
+          if (live && this.state === "booting" && j.engine !== String(ENGINE_VERSION) && !this.upgradedForVersion) {
+            this.upgradedForVersion = true;
+            dbg(`adopted engine v${j.engine} is outdated -> re-pushing v${ENGINE_VERSION}`);
+            setTimeout(() => {
+              void this.boot({ id: this.username, secret: this.secret } as TokenRecord, true).catch(() => {});
+            }, 1500);
+          }
+        }
         if (j.phase === "ready") {
-          if (live) this.awaitingFreshBoot = false;
-          this.setState("ready");
+          if (live) {
+            this.awaitingFreshBoot = false;
+            this.sawReadyInLog = true;
+            this.setState("ready");
+          } else if (this.state === "waking") {
+            // replayed ready from the adopted session's log — the model IS
+            // loaded, but wait for a fresh heartbeat to confirm the loop runs
+            this.sawReadyInLog = true;
+            this.setState("booting", "Reconnecting to your engine");
+          }
         } else if (["booting", "installing-deps", "finding-model", "model-copy", "model-copied", "model-local", "loading-model", "model-from-dataset", "model-download-fallback", "store-loaded", "model-ready"].includes(j.phase)) {
           // Only LIVE booting events prove the new session started — replays
           // of the previous session's boot arrive on every reconnect.
@@ -533,8 +669,15 @@ export class EngineSlot {
         })();
         break;
       }
-      case "hb":
+      case "hb": {
+        // timestamped heartbeats (engine v3+) prove CURRENT liveness —
+        // replayed heartbeats carry old timestamps and are ignored
+        if (typeof j.t === "number" && Date.now() / 1000 - j.t < 180) {
+          this.lastSseAt = Date.now();
+          if (this.state === "waking" && this.sawReadyInLog) this.setState("ready");
+        }
         break;
+      }
       case "cmd":
         break;
       case "err":
@@ -545,58 +688,105 @@ export class EngineSlot {
   }
 
   private nextV(): number {
-    return ++this.cmdV;
+    // Monotonic across restarts: the engine dedupes on `v` and remembers the
+    // last one it saw, so wall-clock milliseconds keep us always ahead.
+    this.cmdV = Math.max(this.cmdV + 1, Date.now());
+    return this.cmdV;
   }
 
-  /** Push a command into the engine's inbox. Media files ride in the same
-   *  dataset version as cmd.json — the engine fetches them by name. */
-  private async sendCmd(cmd: Record<string, any>, files: Record<string, string | Uint8Array> = {}): Promise<void> {
-    cmd.v = this.nextV();
-    cmd.profile = this.profile;
-    const payload: Record<string, string | Uint8Array> = { "cmd.json": JSON.stringify(cmd), ...files };
-    this.lastCmdSentAt = Date.now();
-    await this.kaggle.datasetUpsert(this.username, `shuggle-inbox-${this.ns}`, "Shuggle Inbox", payload, `v${cmd.v}`);
+  /** Push a command into the engine's inbox. Serialized per slot with
+   *  spacing, and insistent through Kaggle's rate limits. Media files ride
+   *  in the same dataset version as cmd.json — the engine fetches them by name. */
+  private sendQueue: Promise<void> = Promise.resolve();
+
+  private sendCmd(cmd: Record<string, any>, files: Record<string, string | Uint8Array> = {}): Promise<void> {
+    const run = async () => {
+      cmd.v = this.nextV();
+      cmd.profile = this.profile;
+      const payload: Record<string, string | Uint8Array> = { "cmd.json": JSON.stringify(cmd), ...files };
+      let lastErr: any = null;
+      for (let attempt = 0; attempt < 6; attempt++) {
+        try {
+          await this.kaggle.datasetUpsert(this.username, `shuggle-inbox-${this.ns}`, "Shuggle Inbox", payload, `v${cmd.v}`);
+          this.lastPushAt = Date.now();
+          this.lastCmdSentAt = Date.now();
+          return;
+        } catch (e: any) {
+          lastErr = e;
+          const msg = String(e?.message ?? e);
+          if (/429|rate|exceed|too many|403/i.test(msg)) {
+            dbg(`sendCmd: rate-limited (attempt ${attempt + 1}), backing off`);
+            await sleep(5000 * (attempt + 1));
+            continue;
+          }
+          throw e;
+        }
+      }
+      throw lastErr;
+    };
+    const spaced = this.sendQueue.then(async () => {
+      const gap = Date.now() - (this.lastPushAt ?? 0);
+      if (gap < 2500) await sleep(2500 - gap);
+    });
+    this.sendQueue = spaced.then(run).catch(() => {
+      // keep the queue alive even when a command ultimately fails
+    });
+    return spaced.then(() => this.sendQueue);
   }
+
+  private lastPushAt = 0;
 
   async wakeAndSend(turn: ChatTurn): Promise<void> {
-    if (this.state === "idle" || this.state === "sleeping" || this.state === "error") {
-      await this.boot({ id: this.username, secret: this.secret } as TokenRecord);
-    }
-    if (this.seenSessionHash[turn.sid] === undefined) {
-      // New session for this engine — create it there, then the delta applies.
-      await this.sendCmd({ type: "new_session", sid: turn.sid });
-      this.seenSessionHash[turn.sid] = "";
-    }
-    // Media files ride along in this inbox version.
-    const files: Record<string, string | Uint8Array> = {};
-    const mediaMeta: any[] = [];
-    for (const m of turn.media ?? []) {
-      if (m.bytes) {
-        files[m.file] = m.bytes;
-        mediaMeta.push({ name: m.name, kind: m.kind, file: m.file });
+    dbg(`wakeAndSend: state=${this.state} sid=${turn.sid.slice(0, 8)}`);
+    const run = async () => {
+      if (this.state === "idle" || this.state === "sleeping" || this.state === "error") {
+        await this.boot({ id: this.username, secret: this.secret } as TokenRecord);
       }
-    }
-    await this.sendCmd(
-      {
-        type: "chat",
-        sid: turn.sid,
-        msg_id: turn.newMsgs[turn.newMsgs.length - 1]?.mid,
-        upto_hash: turn.uptoHash,
-        truncate_mid: turn.truncateMid ?? null,
-        truncate_after_mid: turn.truncateAfterMid ?? null,
-        new_msgs: turn.newMsgs,
-        system: turn.system,
-        settings: turn.settings,
-        search: turn.search ?? { enabled: false, max_queries: 3, pages_per_query: 1 },
-        memory_hash: turn.memoryHash,
-        memory_text: turn.memoryText,
-        thinking: turn.thinking,
-        skills: turn.skills ?? [],
-        media: mediaMeta.length ? mediaMeta : undefined,
-      },
-      files,
-    );
+      dbg("wakeAndSend: booted, pushing session cmd");
+      if (this.seenSessionHash[turn.sid] === undefined) {
+        // New session for this engine — create it there, then the delta applies.
+        await this.sendCmd({ type: "new_session", sid: turn.sid });
+        this.seenSessionHash[turn.sid] = "";
+      }
+      // Media files ride along in this inbox version.
+      const files: Record<string, string | Uint8Array> = {};
+      const mediaMeta: any[] = [];
+      for (const m of turn.media ?? []) {
+        if (m.bytes) {
+          files[m.file] = m.bytes;
+          mediaMeta.push({ name: m.name, kind: m.kind, file: m.file });
+        }
+      }
+      await this.sendCmd(
+        {
+          type: "chat",
+          sid: turn.sid,
+          msg_id: turn.newMsgs[turn.newMsgs.length - 1]?.mid,
+          upto_hash: turn.uptoHash,
+          truncate_mid: turn.truncateMid ?? null,
+          truncate_after_mid: turn.truncateAfterMid ?? null,
+          new_msgs: turn.newMsgs,
+          system: turn.system,
+          settings: turn.settings,
+          search: turn.search ?? { enabled: false, max_queries: 3, pages_per_query: 1 },
+          memory_hash: turn.memoryHash,
+          memory_text: turn.memoryText,
+          thinking: turn.thinking,
+          skills: turn.skills ?? [],
+          media: mediaMeta.length ? mediaMeta : undefined,
+        },
+        files,
+      );
+      dbg("wakeAndSend: chat cmd pushed");
+    };
+    // Serialize wakes per slot — resync continuations and fresh sends must
+    // never interleave boots or double-send the same turn.
+    this.wakeQueue = this.wakeQueue.then(run, run);
+    return this.wakeQueue;
   }
+
+  private wakeQueue: Promise<void> = Promise.resolve();
+  private seenEvents = new Set<string>(); // survives log-loop restarts
 
   async resyncPath(sid: string, history: { role: string; content: string; mid?: string }[]): Promise<void> {
     await this.sendCmd({ type: "edit_path", sid, history });
@@ -613,7 +803,10 @@ export class EngineSlot {
   }
 
   /** Live engine configuration — applied on the next loop tick, NO restart. */
-  async configure(patch: { afkSeconds?: number; vision?: { enabled: boolean; maxFrames?: number; frameSeconds?: number; mediaTokenBudget?: number } }): Promise<void> {
+  async configure(patch: { afkSeconds?: number; memoryTools?: boolean; vision?: { enabled: boolean; maxFrames?: number; frameSeconds?: number; mediaTokenBudget?: number } }): Promise<void> {
+    // remember engine-affecting settings so a later boot bakes them in
+    if (patch.memoryTools !== undefined) this.memoryTools = patch.memoryTools;
+    if (patch.vision) this.vision = { ...this.vision, ...patch.vision };
     if (this.state === "idle" || this.state === "sleeping" || this.state === "error") return; // applied at boot
     await this.sendCmd({ type: "config", patch }).catch(() => {});
   }
@@ -694,10 +887,10 @@ import json, os, sys, time, urllib.request, urllib.error
 BEARER = "__BEARER__"
 OWNER = "__OWNER__"
 REPO_ID = "JonathanColetti/Qwen3.8-27B-Uncensored-GGUF"
-FILES = [
-    ("Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 16.8),
-    ("mmproj-Qwen3.8-27B-Uncensored-F16.gguf", 0.46),
-]
+DATASET = "__DATASET__"
+TITLE = "__TITLE__"
+DESCRIPTION = "__DESCRIPTION__"
+FILES = __FILES__
 BASE = "https://www.kaggle.com/api/v1"
 CHUNK = 64 * 1024 * 1024
 
@@ -721,6 +914,7 @@ for FILENAME, GB in FILES:
     j = rpc("blobs.BlobApiService/StartBlobUpload", {"type": "DATASET", "name": FILENAME,
         "contentType": "application/octet-stream", "contentLength": size,
         "lastModifiedEpochSeconds": int(time.time())})
+    create_url = j["createUrl"]
     slog("Uploading " + FILENAME + " to your Kaggle storage (" + str(GB) + " GB)")
     t0 = time.time()
     sent = 0
@@ -758,21 +952,21 @@ for FILENAME, GB in FILES:
                 slog("Uploaded " + str(round(sent / 1e9, 2)) + " / " + str(round(size / 1e9, 2)) + " GB (" + str(int(rate)) + " MB/s)")
     tokens.append({"token": j["token"], "description": FILENAME, "columns": []})
     os.remove(path)
-slog("Storing as your private model dataset")
+slog("Storing as your private " + DATASET + " dataset")
 try:
-    st = rpc("datasets.DatasetApiService/GetDatasetStatus", {"ownerSlug": OWNER, "datasetSlug": "shuggle-model"})
+    st = rpc("datasets.DatasetApiService/GetDatasetStatus", {"ownerSlug": OWNER, "datasetSlug": DATASET})
     exists = "NOT_FOUND" not in json.dumps(st)
 except Exception:
     exists = False
 body = {"files": tokens,
-        "subtitle": "Shuggle engine model",
-        "description": "Shuggle engine model storage (weights + vision projector). Managed automatically.",
+        "subtitle": "Shuggle engine storage",
+        "description": DESCRIPTION,
         "categoryIds": [], "versionNotes": "seed"}
 if exists:
-    rpc("datasets.DatasetApiService/CreateDatasetVersion", {"ownerSlug": OWNER, "datasetSlug": "shuggle-model", "body": body}, 900)
+    rpc("datasets.DatasetApiService/CreateDatasetVersion", {"ownerSlug": OWNER, "datasetSlug": DATASET, "body": body}, 900)
 else:
-    rpc("datasets.DatasetApiService/CreateDataset", {"ownerSlug": OWNER, "slug": "shuggle-model", "title": "Shuggle Model",
+    rpc("datasets.DatasetApiService/CreateDataset", {"ownerSlug": OWNER, "slug": DATASET, "title": TITLE,
         "licenseName": "CC0-1.0", "isPrivate": True, **body}, 900)
-slog("Setup complete — the model now loads instantly on every boot")
+slog("Setup complete — " + DATASET + " now loads instantly on every boot")
 print("SEED_DONE", flush=True)
 `;

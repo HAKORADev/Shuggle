@@ -426,6 +426,9 @@ function renderMsg(node: any): HTMLElement {
         bubble.prepend(el("div", "attach-chip", `<b>${esc(a.name)}</b><span>${a.chars} chars</span>`));
       }
     }
+    if (node.error) {
+      bubble.appendChild(el("div", "confirm-text", `<span style="color:var(--red)">${esc(node.error)}</span>`));
+    }
     const acts = el("div", "actions");
     acts.appendChild(actionBtn("Copy", `<svg viewBox="0 0 24 24" width="13" height="13"><rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="2" fill="none"/><path d="M5 15V5a2 2 0 0 1 2-2h10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>`, () => navigator.clipboard.writeText(node.content)));
     acts.appendChild(actionBtn("Edit — resend with changes", `<svg viewBox="0 0 24 24" width="13" height="13"><path d="M4 20h4l10.5-10.5a2.1 2.1 0 0 0-3-3L5 17v3z" stroke="currentColor" stroke-width="2" fill="none" stroke-linejoin="round"/></svg>`, () => startEdit(node)));
@@ -498,14 +501,12 @@ function actionBtn(title: string, icon: string, fn: () => void): HTMLElement {
 function dimSwitcher(node: any, dim: { index: number; total: number }): HTMLElement {
   const wrap = el("span");
   wrap.style.cssText = "display:inline-flex;align-items:center;gap:2px;margin:0 4px;";
-  const prev = actionBtn("Previous version", `<svg viewBox="0 0 24 24" width="12" height="12"><path d="M14 6l-6 6 6 6" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`, async () => {
-    await api("POST", `/api/sessions/${app.currentMeta.id}/switch`, { msgId: node.id });
+  const go = (dir: number) => async () => {
+    await api("POST", `/api/sessions/${app.currentMeta.id}/switch`, { msgId: node.id, dir });
     await openSession(app.currentMeta.id);
-  });
-  const next = actionBtn("Next version", `<svg viewBox="0 0 24 24" width="12" height="12"><path d="M10 6l6 6-6 6" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`, async () => {
-    await api("POST", `/api/sessions/${app.currentMeta.id}/switch`, { msgId: node.id });
-    await openSession(app.currentMeta.id);
-  });
+  };
+  const prev = actionBtn("Previous version", `<svg viewBox="0 0 24 24" width="12" height="12"><path d="M14 6l-6 6 6 6" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`, go(-1));
+  const next = actionBtn("Next version", `<svg viewBox="0 0 24 24" width="12" height="12"><path d="M10 6l6 6-6 6" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`, go(1));
   wrap.append(prev, el("span", "meta", `${dim.index}/${dim.total}`), next);
   return wrap;
 }
@@ -1483,7 +1484,7 @@ function openChatSettings(): void {
       <div class="range-row"><input type="range" id="cs-temp" min="0" max="2" step="0.05" value="${o.temperature ?? app.settings.temperature}"/><span class="range-val" id="cs-temp-val">${o.temperature ?? app.settings.temperature}</span></div>
     </div>
     <div class="setting-row"><label class="main">Skills in this chat</label>
-      <div class="desc">Gates all skills for this conversation — the global switch and each skill's own toggle still apply everywhere else.</div>
+      <div class="desc">"Always on here" works even when skills are globally off — this chat only. "Always off here" silences them for this conversation; every other chat follows the global switch.</div>
       <select id="cs-skills">
         <option value="inherit" ${o.skillsEnabled === undefined ? "selected" : ""}>Follow the global switch</option>
         <option value="on" ${o.skillsEnabled === true ? "selected" : ""}>Always on here</option>
