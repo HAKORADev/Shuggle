@@ -556,7 +556,10 @@ export class EngineSlot {
             if (this.seenEvents.has(key)) continue;
             this.seenEvents.add(key);
             if (this.seenEvents.size > 1500) this.seenEvents = new Set([...this.seenEvents].slice(-800));
-            this.lastSseAt = Date.now();
+            // Only LIVE output counts as "the engine is talking". The stream
+            // replays the whole session on every reconnect, so a replay must
+            // not keep the zombie watchdog asleep forever.
+            if (live) this.lastSseAt = Date.now();
             this.handleEvent(j, live);
           }
         }
