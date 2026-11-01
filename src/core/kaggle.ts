@@ -151,6 +151,12 @@ export class Kaggle {
     };
   }
 
+  /** The kernel's pushed script source (for engine-version checks). */
+  async kernelSource(owner: string, slug: string): Promise<string> {
+    const j = await this.expectOk("kernels.KernelsApiService/GetKernel", { userName: owner, kernelSlug: slug }, "get kernel", 60_000);
+    return String(j?.blob?.source ?? "");
+  }
+
   async kernelLog(owner: string, slug: string): Promise<string> {
     let out = "";
     let token = "";

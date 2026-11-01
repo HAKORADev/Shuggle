@@ -8,6 +8,7 @@
 // things that ever need a real engine restart are context-size changes and
 // engine upgrades — everything else applies on the next message.
 
+import { ENGINE_VERSION } from "../version.ts";
 import { Kaggle, sleep } from "./kaggle.ts";
 import { engineScript } from "./kernel.ts";
 import { hsh16 } from "./util.ts";
@@ -178,10 +179,32 @@ export class EngineSlot {
 
   /** Push (or re-push) the engine notebook and wait for it to be ready.
    *  force=true re-pushes even if a session is alive (the Restart button). */
+  /** The engine-script generation actually running on Kaggle (0 = unknown). */
+  private async runningEngineVersion(): Promise<number> {
+    try {
+      const src = await this.kaggle.kernelSource(this.username, this.slug);
+      const m = src.match(/# Engine v(\d+)/);
+      return m ? parseInt(m[1], 10) : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   async boot(record: TokenRecord, force = false): Promise<void> {
     this.lastError = null;
     const st = await this.kaggle.kernelStatus(this.username, this.slug);
     if (st.status === "RUNNING" && !force) {
+      // An engine from an older script generation must NEVER be adopted —
+      // it reads the previous relay slugs and would silently never see the
+      // app's commands. Re-push (the model loads from storage, not re-downloaded).
+      const ver = await this.runningEngineVersion();
+      if (ver > 0 && ver < ENGINE_VERSION) {
+        this.setState("booting", "Upgrading your engine");
+        await this.kaggle.deleteKernel(this.username, this.slug).catch(() => {});
+        await sleep(4_000);
+        await this.pushAndAttach(record, "Upgrading your engine");
+        return;
+      }
       // A session claims to be alive. Verify it actually produces output —
       // Kaggle occasionally leaves zombie sessions (RUNNING with no logs)
       // that would silently queue every new push behind them for hours.
