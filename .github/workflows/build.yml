@@ -76,6 +76,14 @@ jobs:
           [ "$(curl -s http://127.0.0.1:8799/app.js | wc -c)" -gt 1000 ] || (echo "app.js is empty" && exit 1)
           curl -sf -o /dev/null http://127.0.0.1:8799/favicon.png
           kill $SERVER_PID
+      - name: Compress (UPX)
+        shell: bash
+        run: |
+          choco install upx -y --no-progress 2>/dev/null | tail -1
+          UPX_EXE=$(find /c/ProgramData/chocolatey -name "upx.exe" 2>/dev/null | head -1)
+          echo "upx at: $UPX_EXE"
+          "$UPX_EXE" -q Shuggle.exe || echo "upx failed — shipping uncompressed"
+          ./Shuggle.exe version
       - name: Prepare folder (exe + Windows launchers only)
         shell: bash
         run: |
