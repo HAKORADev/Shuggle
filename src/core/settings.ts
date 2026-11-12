@@ -136,7 +136,7 @@ export function defaultSettings(): GlobalSettings {
     aboutYou: "",
     language: { mode: "auto", code: "" },
     skillsEnabled: false,
-    skills: defaultSkills(), // starter skills — user deletions persist as an empty list
+    skills: defaultSkills(), // starter skills ship enabled-capable and editable
     afkMinutes: 3,
     searchEnabled: false,
     searchMaxQueries: 3,

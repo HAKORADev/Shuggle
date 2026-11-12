@@ -187,10 +187,18 @@ export class Profile {
     this.writeDomain("sessions", v);
   }
   readMemoryText(fallback: string): string {
-    return this.readDomain("memory", { text: fallback }).text;
+    return this.readDomain<{ text?: string }>("memory", { text: fallback }).text ?? fallback;
   }
   writeMemoryText(text: string): void {
-    this.writeDomain("memory", { text });
+    // plain write (no revision bump) — the revision-aware path is writeMemoryRaw
+    const prev = this.readDomain<{ text?: string; rev?: number }>("memory", { text: "", rev: 0 });
+    this.writeDomain("memory", { text, rev: prev.rev ?? 0 });
+  }
+  readMemoryRaw<T extends { text?: string }>(fallback: T): T {
+    return this.readDomain<T>("memory", fallback);
+  }
+  writeMemoryRaw(v: { text: string; rev: number }): void {
+    this.writeDomain("memory", v);
   }
   readMemoryHistory<T>(fallback: T): T {
     return this.readDomain("memhist", fallback);

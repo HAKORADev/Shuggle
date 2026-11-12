@@ -59,10 +59,14 @@ export async function detachConsole(): Promise<void> {
 }
 
 /** Open the UI in a real window (Edge first on Windows — that's WebView2 under
- *  the hood; chromium-family app mode elsewhere). Falls back to the default browser. */
-export function openAppWindow(url: string): void {
+ *  the hood; chromium-family app mode elsewhere). Falls back to the default browser.
+ *  `useEdgeData` (Windows): when ON, the window shares the user's real Edge
+ *  profile (history, cookies). When OFF (default) it runs in a private profile
+ *  folder next to the app, so Shuggle never touches their browser data. */
+export function openAppWindow(url: string, opts: { useEdgeData?: boolean; userDataDir?: string } = {}): void {
   const p = process.platform;
   const quiet = { stdio: "ignore", detached: true } as const;
+  const flags = [`--app=${url}`, "--window-size=1280,860", "--no-first-run", "--no-default-browser-check"];
   try {
     if (p === "win32") {
       const edges = [
@@ -73,7 +77,8 @@ export function openAppWindow(url: string): void {
       ];
       for (const e of edges) {
         if (existsSync(e)) {
-          spawn(e, [`--app=${url}`, `--window-size=1280,860`], quiet).unref();
+          const extra = opts.useEdgeData ? [] : ["--user-data-dir=" + (opts.userDataDir ?? "")];
+          spawn(e, [...flags, ...extra.filter(Boolean)], quiet).unref();
           return;
         }
       }
@@ -81,7 +86,7 @@ export function openAppWindow(url: string): void {
     } else if (p === "darwin") {
       for (const b of ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", "/Applications/Chromium.app/Contents/MacOS/Chromium"]) {
         try {
-          spawn(b, [`--app=${url}`, `--window-size=1280,860`], quiet).unref();
+          spawn(b, flags, quiet).unref();
           return;
         } catch {
           /* next */
@@ -92,7 +97,8 @@ export function openAppWindow(url: string): void {
       // Linux: chromium-family app mode, then firefox, then whatever opens URLs.
       for (const b of ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome", "brave-browser", "microsoft-edge"]) {
         try {
-          spawn(b, [`--app=${url}`, `--window-size=1280,860`], quiet).unref();
+          const extra = opts.useEdgeData ? [] : ["--user-data-dir=" + (opts.userDataDir ?? "")];
+          spawn(b, [...flags, ...extra.filter(Boolean)], quiet).unref();
           return;
         } catch {
           /* next */

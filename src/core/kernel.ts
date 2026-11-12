@@ -23,13 +23,12 @@ export interface EngineConfig {
   bearer: string;
   owner: string;
   profile: string;
-  /** Storage namespace — profile + device signature. The app and the kernel
-   *  MUST agree on it, or the engine reads someone else's datasets. */
-  ns: string;
+  ns?: string; // explicit namespace (device-namespace aware) — derived from the profile when absent
+  runId: string;
   contextTokens: number;
   afkSeconds: number;
   memoryTools: boolean;
-  vision: { enabled: boolean; maxFrames: number; frameSeconds: number; mediaTokenBudget: number };
+  vision: { enabled: boolean; maxFrames: number; frameSeconds: number; mediaBudget: number };
 }
 
 interface CmdChat {
@@ -75,12 +74,13 @@ import urllib.parse
 import urllib.request
 
 CFG = json.loads(r'''__CONFIG__''')
-if isinstance(CFG.get("vision"), dict):
-    _v = CFG["vision"]
-    CFG["visionEnabled"] = bool(_v.get("enabled", False))
-    CFG["visionMaxFrames"] = int(_v.get("maxFrames", 8))
-    CFG["visionFrameSeconds"] = int(_v.get("frameSeconds", 2))
-    CFG["mediaBudget"] = int(_v.get("mediaTokenBudget", 8000))
+# flatten the vision/memory knobs so the engine reads them as plain keys
+_v = CFG.get("vision") or {}
+CFG["visionEnabled"] = bool(_v.get("enabled", False))
+CFG["visionMaxFrames"] = int(_v.get("maxFrames", 8))
+CFG["visionFrameSeconds"] = int(_v.get("frameSeconds", 2))
+CFG["mediaBudget"] = int(_v.get("mediaBudget", 8000))
+CFG["memoryTools"] = bool(CFG.get("memoryTools", False))
 BASE = "https://www.kaggle.com/api/v1"
 OWNER = CFG["owner"]
 PROFILE = CFG["profile"]
@@ -94,12 +94,13 @@ MODEL_DIR = os.path.join(WORK, "model")
 MEDIA_DIR = os.path.join(WORK, "media")
 def _slugns(name):
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:20]
-# The app owns the namespace (profile + device signature). Fall back to the
-# profile slug only when the app did not send one.
-NS = CFG.get("ns") or _slugns(PROFILE)
+NS = CFG.get("ns")
+if not NS:
+    NS = _slugns(PROFILE)
+NS = str(NS)[:20]
 STORE_SLUG = "shuggle-store-" + NS
-INBOX_SLUG = "shuggle-inbox-" + NS
-OUTBOX_SLUG = "shuggle-outbox-" + NS
+INBOX_SLUG = "shuggle-inbox-g2-" + NS
+OUTBOX_SLUG = "shuggle-outbox-g2-" + NS
 
 SEARCH_QUERIES_PROMPT = (
     "You generate web search queries. Given the conversation and the user's latest "
@@ -140,8 +141,6 @@ MEMORY_TOOLS_PROMPT = (
     "asks what you remember, asks you to change or forget a memory, or explicitly "
     "wants the list. Do not create memories for small talk or temporary context.\n"
     "- Keep each memory short and factual (one or two sentences).\n"
-    "- When you emit a block, always emit it COMPLETE in one go: opening fence, "
-    "the JSON, closing fence — never stop mid-block.\n"
     "- You may emit multiple blocks in one reply if needed.\n"
     "- The app strips these blocks before your reply is shown; do not repeat their "
     "content in your visible text.\n"
@@ -194,21 +193,8 @@ def hsh(obj):
 STORE = {"sessions": {}, "memory": {"text": "", "hash": "", "deleted": [], "log": []}}
 
 def load_store():
-    raw = None
-    for attempt in range(4):
-        try:
-            raw = _download_bytes(OWNER, STORE_SLUG, "store.json")
-            break
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < 3:
-                time.sleep(4 * (attempt + 1))
-                continue
-            err("store-load", e)
-            return
-        except Exception as e:
-            err("store-load", e)
-            return
     try:
+        raw = _download_bytes(OWNER, STORE_SLUG, "store.json")
         data = json.loads(raw.decode())
         if isinstance(data, dict):
             STORE["sessions"] = data.get("sessions", {})
@@ -223,62 +209,61 @@ def load_store():
     except Exception as e:
         err("store-load", e)
 
-def save_store():
-    for attempt in range(3):
-        try:
-            content = json.dumps(STORE, ensure_ascii=False).encode()
-            j = rpc("blobs.BlobApiService/StartBlobUpload", {
-                "type": "DATASET", "name": "store.json",
-                "contentType": "application/octet-stream",
-                "contentLength": len(content), "lastModifiedEpochSeconds": int(time.time())})
-            req = urllib.request.Request(j["createUrl"], data=content,
-                headers={"Content-Type": "application/octet-stream"}, method="PUT")
-            with urllib.request.urlopen(req, timeout=300) as r:
-                pass
-            rpc("datasets.DatasetApiService/CreateDatasetVersion", {
-                "ownerSlug": OWNER, "datasetSlug": STORE_SLUG,
-                "body": {"files": [{"token": j["token"], "description": "", "columns": []}],
-                         "subtitle": "Shuggle store",
-                         "description": "Shuggle engine storage (sessions, memory). Managed automatically.",
-                         "categoryIds": [], "versionNotes": "t" + str(int(time.time()))}}, 300)
-            slog({"ev": "store-saved"})
-            return
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < 2:
-                time.sleep(5 * (attempt + 1))
-                continue
+def save_store(retries=2):
+    try:
+        content = json.dumps(STORE, ensure_ascii=False).encode()
+        j = rpc("blobs.BlobApiService/StartBlobUpload", {
+            "type": "DATASET", "name": "store.json",
+            "contentType": "application/octet-stream",
+            "contentLength": len(content), "lastModifiedEpochSeconds": int(time.time())})
+        req = urllib.request.Request(j["createUrl"], data=content,
+            headers={"Content-Type": "application/octet-stream"}, method="PUT")
+        with urllib.request.urlopen(req, timeout=300) as r:
+            pass
+        rpc("datasets.DatasetApiService/CreateDatasetVersion", {
+            "ownerSlug": OWNER, "datasetSlug": STORE_SLUG,
+            "body": {"files": [{"token": j["token"], "description": "", "columns": []}],
+                     "subtitle": "Shuggle store",
+                     "description": "Shuggle engine storage (sessions, memory). Managed automatically.",
+                     "categoryIds": [], "versionNotes": "t" + str(int(time.time()))}}, 300)
+        slog({"ev": "store-saved"})
+    except urllib.error.HTTPError as e:
+        if e.code == 429 and retries > 0:
+            time.sleep(45)
+            save_store(retries - 1)
+        else:
             err("store-save", e)
-            return
-        except Exception as e:
-            err("store-save", e)
-            return
+    except Exception as e:
+        err("store-save", e)
 
 # --------------------------------------------------------------- inbox ----
 SEEN_V = 0
+READ_FAILS = 0
 
 def read_cmd():
-    global SEEN_V
+    global SEEN_V, READ_FAILS
     try:
-        for _attempt in range(3):
-            try:
-                raw = _download_bytes(OWNER, INBOX_SLUG, "cmd.json", timeout=30)
-                break
-            except urllib.error.HTTPError as e:
-                if e.code == 429 and _attempt < 2:
-                    time.sleep(4)
-                    continue
-                return None
-            except Exception:
-                return None
-        else:
-            return None
+        raw = _download_bytes(OWNER, INBOX_SLUG, "cmd.json", timeout=30)
+        READ_FAILS = 0
         cmd = json.loads(raw.decode())
         if not isinstance(cmd, dict):
+            return None
+        # run_id gate: commands from OTHER app runs (stale CDN reads of old
+        # inbox versions are a real, observed thing) are ignored entirely -
+        # they must never advance the command cursor or dispatch anything.
+        if cmd.get("run_id") != CFG.get("runId", ""):
+            if cmd.get("type"):
+                err("inbox-stale", "ignoring command from another app run (v=" + str(cmd.get("v")) + ")")
             return None
         if cmd.get("v", 0) <= SEEN_V:
             return None
         return cmd
     except Exception:
+        # rate limits and hiccups happen - hammering the inbox every 2s keeps
+        # the limit hot and starves the app's own polling; back off instead
+        READ_FAILS += 1
+        if READ_FAILS >= 3:
+            time.sleep(min(30, 2 * READ_FAILS))
         return None
 
 def fetch_media(file_name):
@@ -322,6 +307,8 @@ VISION = {"handler": None, "mmproj": None, "name": None, "failed": None}
 CHARS_PER_TOKEN = 3.2
 IMAGE_TOKEN_EST = 600   # 768px ViT, patch16, 2x2 merge -> ~576 embeddings + overhead
 LAST_DONE = None        # last finished reply — the sleeping outbox carries it
+LAST_CMD_V = 0          # version of the command being processed — tags every
+                        # generation event so the app can drop stale replays
 
 def ensure_deps():
     global llm
@@ -498,46 +485,31 @@ def vision_ensure_loaded():
         return False
     if llm is None:
         return False
-    # Candidates in order of fit for a Qwen3-VL style projector
-    # (clip.projector_type = qwen3vl_merger):
-    #   MTMDChatHandler  — llama.cpp's generic multimodal path (mtmd), the
-    #                      only one that understands qwen3-vl projectors.
-    #   Qwen25VLChatHandler / Qwen2VLChatHandler — explicit Qwen VL formats.
-    #   Llava15ChatHandler — generic LLaVA-style fallback.
-    candidates = [
-        ("MTMDChatHandler", lambda p: _mtmd_handler(p)),
-        ("Qwen3VLChatHandler", lambda p: _cls_handler(p, "Qwen3VLChatHandler")),
-        ("Qwen25VLChatHandler", lambda p: _cls_handler(p, "Qwen25VLChatHandler")),
-        ("Qwen2VLChatHandler", lambda p: _cls_handler(p, "Qwen2VLChatHandler")),
-        ("Llava15ChatHandler", lambda p: _cls_handler(p, "Llava15ChatHandler")),
-    ]
-    errors = []
-    for name, make in candidates:
-        try:
-            t0 = time.time()
-            handler = make(VISION["mmproj"])
-            VISION["handler"] = handler
-            VISION["name"] = name
-            llm.chat_handler = handler
-            slog({"ev": "vision-ready", "detail": name, "load_s": round(time.time() - t0, 1)})
-            return True
-        except Exception as e:
-            errors.append(name + ": " + str(e)[:120])
-    VISION["failed"] = "vision handler unavailable (" + "; ".join(errors) + ")"
-    slog({"ev": "vision-unavailable", "d": VISION["failed"]})
-    return False
-
-
-def _cls_handler(path, cls_name):
-    import llama_cpp
-    cls = getattr(llama_cpp, cls_name)
-    return cls(path)
-
-
-def _mtmd_handler(path):
-    import llama_cpp
-    cls = getattr(llama_cpp, "MTMDChatHandler")
-    return cls(path, verbose=False)
+    try:
+        import llama_cpp
+        names = ["Qwen3VLChatHandler", "Qwen25VLChatHandler", "Qwen2VLChatHandler", "Llava15ChatHandler"]
+        handler_cls = None
+        picked = None
+        for n in names:
+            if hasattr(llama_cpp, n):
+                handler_cls = getattr(llama_cpp, n)
+                picked = n
+                break
+        if handler_cls is None:
+            VISION["failed"] = "installed engine build has no vision handler"
+            slog({"ev": "vision-unavailable", "d": VISION["failed"]})
+            return False
+        t0 = time.time()
+        VISION["handler"] = handler_cls(VISION["mmproj"])
+        VISION["name"] = picked
+        llm.chat_handler = VISION["handler"]
+        slog({"ev": "vision-ready", "detail": picked, "load_s": round(time.time() - t0, 1)})
+        return True
+    except Exception as e:
+        VISION["failed"] = str(e)[:300]
+        VISION["handler"] = None
+        slog({"ev": "vision-unavailable", "d": VISION["failed"]})
+        return False
 
 def vision_unload():
     if VISION.get("handler") and llm is not None:
@@ -668,6 +640,7 @@ class Splitter:
         return None
 
 def generate(sid, messages, settings, thinking, search_cfg):
+    cmd_v = LAST_CMD_V
     if not thinking:
         messages = [dict(m) for m in messages]
         if messages and messages[-1]["role"] == "user":
@@ -677,10 +650,7 @@ def generate(sid, messages, settings, thinking, search_cfg):
     search_brief = None
     search_queries = []
     if search_cfg and search_cfg.get("enabled"):
-        search_brief, search_queries = do_search(messages, search_cfg, settings)
-        if search_brief:
-            messages = [dict(m) for m in messages]
-            messages[0]["content"] = (messages[0].get("content", "") + "\n\n" + search_brief).strip()
+        search_brief, search_queries, messages = do_search(messages, search_cfg, settings)
     stream = llm.create_chat_completion(
         messages=messages,
         temperature=float(settings.get("temperature", 0.7)),
@@ -704,7 +674,7 @@ def generate(sid, messages, settings, thinking, search_cfg):
         if now - last_emit > 0.45:
             for k in ("think", "text"):
                 if pending[k]:
-                    slog({"ev": "chunk", "sid": sid, "seq": seq, "k": k, "t": pending[k]})
+                    slog({"ev": "chunk", "sid": sid, "seq": seq, "k": k, "t": pending[k], "v": cmd_v})
                     seq += 1
                     pending[k] = ""
             last_emit = now
@@ -712,7 +682,7 @@ def generate(sid, messages, settings, thinking, search_cfg):
     reclass = fin == "reclass"
     for k in ("think", "text"):
         if pending[k]:
-            slog({"ev": "chunk", "sid": sid, "seq": seq, "k": k, "t": pending[k]})
+            slog({"ev": "chunk", "sid": sid, "seq": seq, "k": k, "t": pending[k], "v": cmd_v})
             seq += 1
             pending[k] = ""
     gen_ms = int((time.time() - t0) * 1000)
@@ -720,7 +690,7 @@ def generate(sid, messages, settings, thinking, search_cfg):
     content_out = sp.text_full if not reclass else (sp.think_full + sp.text_full)
     content_out = content_out.lstrip("\n")
     if reclass:
-        slog({"ev": "reclass", "sid": sid})
+        slog({"ev": "reclass", "sid": sid, "v": cmd_v})
     return {
         "content": content_out,
         "thinking": thinking_out,
@@ -783,39 +753,52 @@ def do_search(messages, search_cfg, settings):
     max_q = int(search_cfg.get("max_queries", 3))
     pages = int(search_cfg.get("pages_per_query", 1))
     convo_tail = "\n".join(m.get("content", "")[:600] if isinstance(m.get("content"), str) else "" for m in messages[-6:])
-    slog({"ev": "search", "phase": "planning"})
+    slog({"ev": "search", "phase": "planning", "v": LAST_CMD_V})
     res = llm.create_chat_completion(
         messages=[{"role": "system", "content": SEARCH_QUERIES_PROMPT.replace("{max_q}", str(max_q))},
                   {"role": "user", "content": convo_tail}],
         temperature=0.2, max_tokens=120)
     raw = res["choices"][0]["message"]["content"].strip()
     queries = [q.strip("-*0123456789. ") for q in raw.splitlines() if q.strip()][:max_q]
-    slog({"ev": "search", "phase": "queries", "data": queries})
+    slog({"ev": "search", "phase": "queries", "data": queries, "v": LAST_CMD_V})
     all_results = []
     for q in queries:
         all_results.extend(ddg_fetch(q, pages))
     all_results = all_results[:24]
-    slog({"ev": "search", "phase": "results", "data": len(all_results)})
+    slog({"ev": "search", "phase": "results", "data": len(all_results), "v": LAST_CMD_V})
     if not all_results:
         return None, queries, messages
     blobs = []
     for i, r in enumerate(all_results):
         blobs.append(f"[{i+1}] {r['title']} — {r['snippet']}")
     results_text = "\n".join(blobs)[:9000]
-    slog({"ev": "search", "phase": "digesting"})
+    slog({"ev": "search", "phase": "digesting", "v": LAST_CMD_V})
     dres = llm.create_chat_completion(
         messages=[{"role": "system", "content": SEARCH_DIGEST_PROMPT},
                   {"role": "user", "content": "User request:\n" + convo_tail[-1500:] + "\n\nResults:\n" + results_text}],
         temperature=0.2, max_tokens=900)
     brief = dres["choices"][0]["message"]["content"].strip()
     if brief == "NO_RESULTS" or not brief:
-        slog({"ev": "search", "phase": "empty"})
-        return None, queries
-    slog({"ev": "search", "phase": "brief", "data": brief[:120]})
-    # returned as TEXT — the caller merges it into the single leading system
-    # message (the chat template forbids a second system message mid-list)
-    brief_text = ("Fresh web research brief for the user's request (sources in parentheses):\n" + brief)
-    return brief_text, queries
+        slog({"ev": "search", "phase": "empty", "v": LAST_CMD_V})
+        return None, queries, messages
+    slog({"ev": "search", "phase": "brief", "data": brief[:120], "v": LAST_CMD_V})
+    new_messages = list(messages)
+    # The brief rides INSIDE the final user message — newer Qwen templates
+    # forbid system messages anywhere but the very beginning of the list.
+    brief_text = "[Fresh web research brief for this request — facts with their source titles in parentheses. Use what helps, ignore the rest:]\n" + brief + "\n[/web research brief]\n\n"
+    last = new_messages[-1] if new_messages else None
+    if last and last.get("role") == "user":
+        c = last.get("content")
+        if isinstance(c, list):  # multimodal — prepend to the first text part
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    part["text"] = brief_text + part.get("text", "")
+                    break
+        else:
+            last["content"] = brief_text + str(c or "")
+    else:
+        new_messages.append({"role": "user", "content": brief_text + "Answer the user's latest message with this research in mind."})
+    return brief, queries, new_messages
 
 # ------------------------------------------------------- memory ops (v3) ----
 MEM_CAP = 10000
@@ -831,7 +814,8 @@ def mem_blocks():
 def mem_set_text(new_text):
     mem_state()["text"] = new_text
     mem_state()["hash"] = hsh(new_text)
-    slog({"ev": "mem", "hash": mem_state()["hash"], "text": new_text})
+    mem_state()["rev"] = int(time.time() * 1000)
+    slog({"ev": "mem", "hash": mem_state()["hash"], "text": new_text, "rev": mem_state()["rev"]})
 
 def mem_log(line):
     log = mem_state().setdefault("log", [])
@@ -961,20 +945,13 @@ def extract_memory_ops(text):
         if start < 0:
             cleaned_parts.append(rest)
             break
+        end = rest.find(BT, start + len(used))
+        body = rest[start + len(used):end] if end >= 0 else rest[start + len(used):]
         cleaned_parts.append(rest[:start])
-        after = start + len(used)
-        tail = rest[after:]
-        if tail.lstrip("\n").startswith(BT + "json"):
-            # nested fence: marker, then a json sub-fence, then two closers
-            lead = len(tail) - len(tail.lstrip("\n"))
-            off = after + lead + len(BT) + 4
-            end = rest.find(BT, off)
-            body = rest[off:end] if end >= 0 else rest[off:]
-            rest = rest[end + 3:] if end >= 0 else ""
+        if end >= 0:
+            rest = rest[end + 3:]
         else:
-            end = rest.find(BT, after)
-            body = rest[after:end] if end >= 0 else rest[after:]
-            rest = rest[end + 3:] if end >= 0 else ""
+            rest = ""
         body = body.strip()
         if body.startswith("json"):
             body = body[4:].strip()
@@ -1015,16 +992,24 @@ def serialize_mem_blocks(blocks):
 def handle_mem(cmd):
     if cmd["type"] == "mem_set":
         mem = mem_state()
+        rev = int(cmd.get("rev", 0))
+        if rev and rev < int(mem.get("rev", 0) or 0):
+            # a stale replay of an older edit must never rewind memory
+            err("mem-stale", "ignoring mem_set rev " + str(rev) + " <= " + str(mem.get("rev")))
+            return
         mem["text"] = cmd.get("text", "")
         mem["hash"] = cmd.get("hash", "")
+        if rev:
+            mem["rev"] = rev
         if cmd.get("deleted") is not None:
             mem["deleted"] = cmd.get("deleted", [])
-        slog({"ev": "mem", "hash": mem["hash"]})
+        slog({"ev": "mem", "hash": mem["hash"], "text": mem["text"], "rev": mem.get("rev", 0)})
         save_store()
     elif cmd["type"] == "mem_get":
         mem = mem_state()
-        slog({"ev": "mem", "hash": mem.get("hash", ""), "text": mem.get("text", "")[:2000],
-              "deleted": len(mem.get("deleted", []))})
+        # hash + counts only — the full text lives in the app already; a sliced
+        # echo here would once overwrite the user's real memory with a stub
+        slog({"ev": "mem", "hash": mem.get("hash", ""), "deleted": len(mem.get("deleted", []))})
 
 # ------------------------------------------------------------- dispatcher ----
 def history_projection(hist):
@@ -1037,6 +1022,17 @@ def handle_chat(cmd):
     hist = sess.get("history", [])
     upto = cmd.get("upto_hash", "")
     cur_hash = hsh(history_projection(hist))
+    if cur_hash != upto:
+        # Self-heal: the command carries the app's authoritative history —
+        # adopt it when it hashes to exactly what the app expects. This works
+        # with NO round-trip, even if the resync event never reaches the app.
+        fp = cmd.get("full_path")
+        if isinstance(fp, list):
+            fp_norm = [{"role": m["role"], "content": m["content"], **({"mid": m["mid"]} if m.get("mid") else {})} for m in fp]
+            if hsh(history_projection(fp_norm)) == upto:
+                hist = fp_norm
+                cur_hash = upto
+                slog({"ev": "cmd", "v": cmd.get("v", 0), "type": "self-heal", "msgs": len(hist)})
     if cur_hash != upto:
         tm = cmd.get("truncate_mid")
         if tm:
@@ -1086,15 +1082,19 @@ def handle_chat(cmd):
     while total_chars(hist, len(cmd.get("system", ""))) > limit and len(hist) > 3:
         hist.pop(0)
 
-    if cmd.get("memory_text") is not None and cmd.get("memory_hash") is not None:
-        if mem_state().get("hash") != cmd["memory_hash"]:
-            mem_state()["text"] = cmd["memory_text"]
-            mem_state()["hash"] = cmd["memory_hash"]
+    # Bootstrap only: the engine's store is the source of truth for memory
+    # (stale CDN replays of old commands must never rewind it - seen live).
+    # The app pushes its copy only to seed a brand-new engine store.
+    if cmd.get("memory_text") and not mem_state().get("text"):
+        mem_state()["text"] = cmd["memory_text"]
+        mem_state()["hash"] = cmd.get("memory_hash", "")
+        if cmd.get("memory_rev"):
+            mem_state()["rev"] = int(cmd["memory_rev"])
 
-    # ONE system message, always first: the model's chat template hard-rejects
-    # any system message that is not the very first (Qwen3.x strict rule), so
-    # skills, memory tools and the memory log merge in as labeled sections.
-    sys_parts = [cmd.get("system", "")]
+    # ONE system message: newer Qwen chat templates raise if any system
+    # message sits anywhere but index 0 — persona, skills, memory-tool and
+    # memory-log blocks all merge into a single leading system prompt.
+    system_parts = [cmd.get("system", "")]
     skills = cmd.get("skills") or []
     if skills:
         blocks = []
@@ -1106,13 +1106,13 @@ def handle_chat(cmd):
                 b += "Why it exists: " + s["why"] + "\n"
             b += "---\n" + s.get("content", "") + "\n---"
             blocks.append(b)
-        sys_parts.append(SKILLS_HANDLER_PROMPT + "\n\nThe skills:\n\n" + "\n\n".join(blocks))
+        system_parts.append(SKILLS_HANDLER_PROMPT + "\n\nThe skills:\n\n" + "\n\n".join(blocks))
     if bool(CFG.get("memoryTools", False)):
-        sys_parts.append(MEMORY_TOOLS_PROMPT)
+        system_parts.append(MEMORY_TOOLS_PROMPT)
         log_lines = mem_state().get("log", [])
         if log_lines:
-            sys_parts.append("Memory system results from your last operations:\n" + "\n".join(log_lines[-6:]))
-    msgs = [{"role": "system", "content": "\n\n".join(p for p in sys_parts if p)}]
+            system_parts.append("Memory system results from your last operations:\n" + "\n".join(log_lines[-6:]))
+    msgs = [{"role": "system", "content": "\n\n".join(p for p in system_parts if p.strip())}]
 
     # build the LLM message list (media attached to the current user turn;
     # older media replaced with honest placeholders once the budget is spent)
@@ -1167,13 +1167,13 @@ def handle_chat(cmd):
             except Exception:
                 pass
 
-    slog({"ev": "gen-start", "sid": sid})
+    slog({"ev": "gen-start", "sid": sid, "v": LAST_CMD_V})
     try:
         result = generate(sid, llm_msgs, cmd.get("settings", {}),
                           bool(cmd.get("thinking", True)), cmd.get("search"))
     except Exception as e:
         err("generate", e)
-        slog({"ev": "failed", "sid": sid, "d": str(e)[:300]})
+        slog({"ev": "failed", "sid": sid, "d": str(e)[:300], "v": cmd.get("v", 0)})
         outbox_push({"ev": "failed", "sid": sid, "v": cmd.get("v", 0), "d": str(e)[:300]})
         return
     mem_results = None
@@ -1190,7 +1190,7 @@ def handle_chat(cmd):
           "out_tokens": result["out_tokens"], "chars": len(result["content"]),
           "think_chars": len(result["thinking"] or ""), "search_brief": result["search_brief"],
           "search_queries": result["search_queries"],
-          "mem_results": mem_results})
+          "mem_results": mem_results, "v": cmd.get("v", 0)})
     outbox_push({"ev": "done", "sid": sid, "v": cmd.get("v", 0), "gen_ms": result["gen_ms"],
                  "chars": len(result["content"]), "think_chars": len(result["thinking"] or ""),
                  "content": result["content"],
@@ -1199,7 +1199,7 @@ def handle_chat(cmd):
                  "search_queries": result["search_queries"],
                  "mem_results": mem_results})
     global LAST_DONE
-    LAST_DONE = {"sid": sid, "v": cmd.get("v", 0), "gen_ms": result["gen_ms"], "content": result["content"],
+    LAST_DONE = {"sid": sid, "v": cmd.get("v", 0), "msg_id": cmd.get("msg_id"), "gen_ms": result["gen_ms"], "content": result["content"],
                  "thinking": result["thinking"], "mem_results": mem_results}
     save_store()
 
@@ -1226,14 +1226,15 @@ def handle_config(cmd):
             vision_unload()
         else:
             VISION["failed"] = None
-    slog({"ev": "config", "patch": {k: CFG.get(k) for k in ("afkSeconds", "memoryTools", "visionEnabled", "visionMaxFrames", "visionFrameSeconds", "mediaBudget")}})
+    slog({"ev": "config", "patch": {k: CFG.get(k) for k in ("afkSeconds", "visionEnabled", "visionMaxFrames", "visionFrameSeconds", "mediaBudget", "memoryTools")}})
 
 def dispatch(cmd):
-    global SEEN_V, LAST_CMD, LAST_DONE
+    global SEEN_V, LAST_CMD, LAST_DONE, LAST_CMD_V
     if cmd.get("profile") and cmd["profile"] != PROFILE:
         slog({"ev": "err", "where": "profile", "d": "command is for another profile"})
         return
     SEEN_V = cmd.get("v", SEEN_V + 1)
+    LAST_CMD_V = int(cmd.get("v", 0))
     LAST_CMD = time.time()
     t = cmd.get("type", "")
     slog({"ev": "cmd", "v": cmd.get("v"), "type": t})
@@ -1242,7 +1243,8 @@ def dispatch(cmd):
     if t == "sleep":
         save_store()
         slog({"ev": "sleeping", "reason": "request"})
-        outbox_push({"ev": "sleeping", "v": cmd.get("v", 0), "last_done": LAST_DONE})
+        outbox_push({"ev": "sleeping", "v": cmd.get("v", 0), "last_done": LAST_DONE,
+                     "mem": {"text": mem_state().get("text", ""), "hash": mem_state().get("hash", ""), "rev": int(mem_state().get("rev", 0) or 0)}})
         time.sleep(1)
         sys.exit(0)
     if t == "config":
@@ -1274,24 +1276,29 @@ def main():
     if CFG.get("visionEnabled", False):
         vision_check_ready()
     slog({"ev": "meta", "phase": "ready"})
+    # durable ready signal — the app may be rate-limited on the log stream,
+    # but the outbox always lands (overwrites the booting announce). Carries
+    # the memory snapshot so engine-side memory edits always reach the app.
+    try:
+        outbox_push({"ev": "ready", "mem": {"text": mem_state().get("text", ""), "hash": mem_state().get("hash", ""), "rev": int(mem_state().get("rev", 0) or 0)}})
+    except Exception as e:
+        err("outbox-ready", e)
     LAST_CMD = time.time()
     last_hb = time.time()
-    first_cmd_seen = False
     while True:
         cmd = read_cmd()
         if cmd:
-            first_cmd_seen = True
             dispatch(cmd)
         if time.time() - last_hb > 45:
-            # timestamp makes every heartbeat unique — the app dedupes exact
-            # repeats, and a deduped heartbeat would look like silence
-            slog({"ev": "hb", "t": int(time.time())})
+            slog({"ev": "hb", "v": SEEN_V})
             last_hb = time.time()
-        threshold = int(CFG.get("afkSeconds", 180)) if first_cmd_seen else max(int(CFG.get("afkSeconds", 180)), 600)
-        if time.time() - LAST_CMD > threshold:
+        if time.time() - LAST_CMD > int(CFG.get("afkSeconds", 180)) and READ_FAILS < 5:
+            # never afk-sleep while the inbox is unreachable - there may be a
+            # queued command we simply cannot see yet
             save_store()
             slog({"ev": "sleeping", "reason": "afk"})
-            outbox_push({"ev": "sleeping", "reason": "afk", "last_done": LAST_DONE})
+            outbox_push({"ev": "sleeping", "reason": "afk", "last_done": LAST_DONE,
+                         "mem": {"text": mem_state().get("text", ""), "hash": mem_state().get("hash", ""), "rev": int(mem_state().get("rev", 0) or 0)}})
             time.sleep(1)
             sys.exit(0)
         time.sleep(2)

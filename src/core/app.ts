@@ -26,7 +26,7 @@ export class AppContext {
   sessions: Store = emptyStore();
   settings: GlobalSettings = defaultSettings();
   tokens: TokenPool = emptyPool();
-  memory: MemoryState = { text: "", history: [] };
+  memory: MemoryState = { text: "", rev: 0, history: [] };
 
   // engine slots by kaggle username
   slots = new Map<string, EngineSlot>();
@@ -72,7 +72,7 @@ export class AppContext {
           this.profile.writeTokens(this.tokens);
           break;
         case "memory":
-          this.profile.writeMemoryText(this.memory.text);
+          this.profile.writeMemoryRaw({ text: this.memory.text, rev: this.memory.rev });
           break;
         case "memhist":
           this.profile.writeMemoryHistory(this.memory.history);
@@ -89,7 +89,7 @@ export class AppContext {
       this.profile.writeSessions(this.sessions);
       this.profile.writeSettings(this.settings);
       this.profile.writeTokens(this.tokens);
-      this.profile.writeMemoryText(this.memory.text);
+      this.profile.writeMemoryRaw({ text: this.memory.text, rev: this.memory.rev });
       this.profile.writeMemoryHistory(this.memory.history);
     } catch {
       /* best effort */
@@ -127,6 +127,7 @@ export class AppContext {
     this.tokens = p.readTokens(emptyPool());
     this.memory = {
       text: p.readMemoryText(""),
+      rev: 0,
       history: p.readMemoryHistory<MemoryEntry[]>([]),
     };
     this.events.emit("changed");
@@ -140,7 +141,7 @@ export class AppContext {
     this.profile = null;
     this.sessions = emptyStore();
     this.tokens = emptyPool();
-    this.memory = { text: "", history: [] };
+    this.memory = { text: "", rev: 0, history: [] };
   }
 
   private writeDevice(): void {

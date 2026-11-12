@@ -36,6 +36,16 @@ export class Server {
   private sessionCookie: string | null = null;
   private lastActivity = Date.now();
   private tasks = new Map<string, ChatTask>(); // sid -> in-flight task
+  private pendingSends = new Set<string>(); // synchronous gate — concurrent POSTs once slipped past the async task check
+  /** Synchronous mutex: true when the gate was free (and is now held). */
+  private gate(sid: string): boolean {
+    if (this.pendingSends.has(sid) || this.tasks.has(sid)) return false;
+    this.pendingSends.add(sid);
+    return true;
+  }
+  private ungate(sid: string): void {
+    this.pendingSends.delete(sid);
+  }
   private pingTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -279,12 +289,15 @@ export class Server {
         this.broadcast("vision", { slot, state: ev.state, detail: ev.detail ?? null });
         break;
       case "mem": {
-        // Engine-side memory operations changed the memory text — mirror it.
-        if (typeof ev.text === "string") {
+        // Engine-side memory operations changed the memory text — mirror it,
+        // but never rewind: only adopt revisions newer than what we have.
+        const memRev = typeof ev.rev === "number" ? ev.rev : 0;
+        if (typeof ev.text === "string" && memRev >= (this.app.memory.rev ?? 0)) {
           this.app.memory.text = ev.text;
+          this.app.memory.rev = Math.max(this.app.memory.rev ?? 0, memRev);
           this.persist("memory");
           this.broadcast("memory-updated", { hash: ev.hash ?? null, text: ev.text });
-        } else {
+        } else if (typeof ev.text !== "string") {
           this.broadcast("memory-touched", { hash: ev.hash ?? null });
         }
         break;
@@ -618,7 +631,12 @@ export class Server {
         return this.fail(`memories are limited to ${this.app.settings.memoryMaxChars} characters`);
       }
       this.app.memory.text = text;
+      this.app.memory.rev = Date.now(); // explicit user edit — newest revision wins everywhere
       this.app.save("memory", 0);
+      // push the edit to every live engine (stale replays can never rewind it)
+      for (const slot of this.app.slots.values()) {
+        void slot.setMemory(text, hsh16(text), this.app.memory.rev).catch(() => {});
+      }
       return this.json({ ok: true });
     }
 
@@ -739,6 +757,16 @@ export class Server {
   }
 
   private async send(s: SessionData, text: string, attachments: any[], media: IncomingMedia[] = []): Promise<Response> {
+    // synchronous duplicate gate (see pendingSends)
+    if (!this.gate(s.id)) return this.json({ error: "still answering the previous message" }, 409);
+    try {
+      return await this.sendInner(s, text, attachments, media);
+    } finally {
+      this.ungate(s.id);
+    }
+  }
+
+  private async sendInner(s: SessionData, text: string, attachments: any[], media: IncomingMedia[] = []): Promise<Response> {
     try {
       let full = text;
       let meta: any[] = [];
@@ -833,6 +861,7 @@ export class Server {
             search: { enabled: s.searchEnabled, max_queries: g.searchMaxQueries, pages_per_query: g.searchPagesPerQuery },
             memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
             memoryText: s.memoryEnabled ? this.app.memory.text : null,
+            memoryRev: s.memoryEnabled ? this.app.memory.rev : 0,
             thinking: s.thinkingEnabled,
             skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
             media: mediaFiles.length ? mediaFiles.map((m) => ({ name: m.name, kind: m.kind, file: m.file, bytes: m.bytes })) : undefined,
@@ -910,6 +939,7 @@ export class Server {
             search: { enabled: s.searchEnabled, max_queries: g.searchMaxQueries, pages_per_query: g.searchPagesPerQuery },
             memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
             memoryText: s.memoryEnabled ? this.app.memory.text : null,
+            memoryRev: s.memoryEnabled ? this.app.memory.rev : 0,
             thinking: s.thinkingEnabled,
             skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
           };
@@ -996,6 +1026,7 @@ export class Server {
             search: { enabled: s.searchEnabled, max_queries: g.searchMaxQueries, pages_per_query: g.searchPagesPerQuery },
             memoryHash: s.memoryEnabled ? hsh16(this.app.memory.text) : null,
             memoryText: s.memoryEnabled ? this.app.memory.text : null,
+            memoryRev: s.memoryEnabled ? this.app.memory.rev : 0,
             thinking: s.thinkingEnabled,
             skills: skills.map((sk) => ({ title: sk.title, when: sk.when, why: sk.why, content: sk.content })),
           };

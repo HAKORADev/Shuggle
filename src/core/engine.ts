@@ -14,6 +14,7 @@ import { ENGINE_VERSION } from "../version.ts";
 import { hsh16 } from "./util.ts";
 import { TokenRecord } from "./tokens.ts";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 
 export interface EngineVisionConfig {
   enabled: boolean;
@@ -60,6 +61,7 @@ export interface ChatTurn {
   search?: { enabled: boolean; max_queries: number; pages_per_query: number };
   memoryHash: string | null;
   memoryText: string | null;
+  memoryRev?: number;
   thinking: boolean;
   skills?: { title: string; when: string; why: string; content: string }[];
   media?: MediaItem[]; // images/videos traveling with this turn
@@ -76,6 +78,10 @@ export class EngineSlot {
   private secret: string;
   private kaggle: Kaggle;
   private events: EventEmitter;
+  /** Identifies THIS app run — every command carries it and the engine ignores
+   *  anything else. A stale CDN read of an old inbox version (observed live)
+   *  can then never advance the engine's command cursor. */
+  readonly runId = randomUUID().slice(0, 12);
   private cmdV = 0;
   private state: SlotState = "idle";
   private abortLog: AbortController | null = null;
@@ -175,8 +181,8 @@ export class EngineSlot {
 
   private async ensureDatasetsOnce(): Promise<void> {
     const jobs: [string, string, string][] = [
-      [`shuggle-inbox-${this.ns}`, "Shuggle Inbox", "Shuggle command relay for the Shuggle engine. Managed automatically."],
-      [`shuggle-outbox-${this.ns}`, "Shuggle Outbox", "Shuggle response relay for the Shuggle engine. Managed automatically."],
+      [`shuggle-inbox-g2-${this.ns}`, "Shuggle Inbox", "Shuggle command relay for the Shuggle engine. Managed automatically."],
+      [`shuggle-outbox-g2-${this.ns}`, "Shuggle Outbox", "Shuggle response relay for the Shuggle engine. Managed automatically."],
       [`shuggle-store-${this.ns}`, "Shuggle Store", "Shuggle engine storage for chats and memories. Managed automatically."],
     ];
     for (const [slug, title, desc] of jobs) {
@@ -299,6 +305,7 @@ export class EngineSlot {
       owner: this.username,
       profile: this.profile,
       ns: this.ns,
+      runId: this.runId,
       contextTokens: this.contextTokens,
       afkSeconds: this.afkSeconds,
       memoryTools: this.memoryTools,
@@ -472,7 +479,7 @@ export class EngineSlot {
     this.outboxTimer = setInterval(async () => {
       if (this.state === "sleeping" || this.state === "idle") return;
       try {
-        const text = await this.kaggle.datasetDownloadText(this.username, `shuggle-outbox-${this.ns}`, "state.json");
+        const text = await this.kaggle.datasetDownloadText(this.username, `shuggle-outbox-g2-${this.ns}`, "state.json");
         if (!text || text === lastOutbox) return;
         lastOutbox = text;
         const j = JSON.parse(text);
@@ -689,7 +696,7 @@ export class EngineSlot {
         break;
       case "mem":
         this.memHash = j.hash ?? "";
-        this.emit("mem", { hash: j.hash, text: j.text ?? null });
+        this.emit("mem", { hash: j.hash, text: j.text ?? null, rev: j.rev ?? 0 });
         break;
       case "store-saved":
         break;
@@ -751,13 +758,15 @@ export class EngineSlot {
     const run = async () => {
       cmd.v = this.nextV();
       cmd.profile = this.profile;
+    cmd.run_id = this.runId;
       const payload: Record<string, string | Uint8Array> = { "cmd.json": JSON.stringify(cmd), ...files };
       let lastErr: any = null;
       for (let attempt = 0; attempt < 6; attempt++) {
         try {
-          await this.kaggle.datasetUpsert(this.username, `shuggle-inbox-${this.ns}`, "Shuggle Inbox", payload, `v${cmd.v}`);
+          await this.kaggle.datasetUpsert(this.username, `shuggle-inbox-g2-${this.ns}`, "Shuggle Inbox", payload, `v${cmd.v}`);
           this.lastPushAt = Date.now();
           this.lastCmdSentAt = Date.now();
+    this.lastSentCmdV = cmd.v;
           return cmd.v;
         } catch (e: any) {
           lastErr = e;
@@ -793,6 +802,7 @@ export class EngineSlot {
   private lastPushAt = 0;
   /** Command ids the engine has echoed back — proof that it is really alive. */
   private echoedVs = new Set<number>();
+  private lastSentCmdV = 0;
 
   async wakeAndSend(turn: ChatTurn): Promise<void> {
     dbg(`wakeAndSend: state=${this.state} sid=${turn.sid.slice(0, 8)}`);
@@ -850,9 +860,9 @@ export class EngineSlot {
     await this.sendCmd({ type: "edit_path", sid, history });
   }
 
-  async setMemory(text: string, hash: string, deleted?: any[]): Promise<void> {
+  async setMemory(text: string, hash: string, rev = 0, deleted?: any[]): Promise<void> {
     this.memHash = hash;
-    await this.sendCmd({ type: "mem_set", text, hash, deleted: deleted ?? [] });
+    await this.sendCmd({ type: "mem_set", text, hash, rev, deleted: deleted ?? [] });
   }
 
   async memoryHashRequest(): Promise<string> {
@@ -870,6 +880,7 @@ export class EngineSlot {
   }
 
   async ping(): Promise<void> {
+    if (this.lastSentCmdV > 0 && !this.echoedVs.has(this.lastSentCmdV)) return; // a command is still queued unconsumed — never clobber it
     // Pings ride the same snapshot-semantics inbox as chat commands — a ping
     // must never overwrite a freshly queued chat. Only ping a proven-idle
     // engine, and never within 20s of sending a real command.
