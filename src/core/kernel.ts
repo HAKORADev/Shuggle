@@ -367,8 +367,8 @@ def preload_cuda():
     libs = []
     for d in sorted(glob.glob(os.path.join(LIBS_DIR, "nvidia", "*", "lib"))):
         libs.extend(sorted(glob.glob(os.path.join(d, "*.so*"))))
-    for d in sorted(glob.glob(os.path.join(LIBS_DIR, "llama_cpp_python.libs"))):
-        libs.extend(sorted(glob.glob(os.path.join(d, "*.so*"))))
+    # (the wheel's own libraries are found through its RUNPATH — preloading
+    # the 928 MB ggml-cuda blob would be pointless)
     # the wheel's own bundled libraries first (they are the right build)
     # the runtime first — everything else may depend on it
     libs.sort(key=lambda p: (0 if "cudart" in os.path.basename(p) else 1, p))
@@ -414,6 +414,14 @@ def ensure_deps():
                             "numpy", "typing-extensions", "diskcache", "jinja2"], check=True)
             # The CUDA wheel carries its own CUDA libraries (1.8 GB), so nothing
             # else is needed. It is a big download: give it time and retries.
+            # The CUDA wheel carries ggml-cuda but NOT the CUDA runtime — that
+            # comes from nvidia's own redistributable packages, and the loader
+            # cannot see them without the preload below.
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--timeout", "120", "--retries", "5",
+                            "--target", LIBS_DIR,
+                            "nvidia-cuda-runtime-cu12", "nvidia-cublas-cu12",
+                            "nvidia-cuda-nvrtc-cu12", "nvidia-curand-cu12",
+                            "nvidia-cusparse-cu12", "nvidia-cufft-cu12"], check=False)
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--timeout", "120", "--retries", "5",
                             "--target", LIBS_DIR, "--no-deps", WHEEL], check=True)
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
