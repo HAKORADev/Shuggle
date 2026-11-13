@@ -85,6 +85,15 @@ Launchers do the same thing without typing: `Shuggle.bat`, `Shuggle CLI.bat`, `S
 
 Interactive commands: `/new /open /list /rename /del /pin /search /think /memory /tokens /use /status /sleep /help`
 
+## Where To Get It
+
+The project is still in development, so the binaries are published as a **private pre-release** on the commit-sandbox repo (`HAKORADev/shuggle-commits-otg`, releases → `v0.5.0-alpha.1`):
+
+- `Shuggle-windows-x64.zip` — the exe and the launchers (one download)
+- `Shuggle.exe.part00 … part04` — the same exe in 25 MB pieces, for slow lines; drop them next to `Shuggle.bat` and it joins them on the first run
+- `Shuggle-launchers.zip` — just the `.bat` files, for the pieces route
+- `Shuggle-linux-x64.zip` and `shuggle.part*` — the same for Linux
+
 ## Build It Yourself
 
 The binaries are built from source with [Bun](https://bun.sh) — no Actions, no CI account, no mystery.
