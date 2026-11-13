@@ -492,15 +492,16 @@ export class Server {
       const prevVision = JSON.stringify(this.app.settings.vision);
       const prevMemTools = !!this.app.settings.memoryTools;
       let visionNote = "";
-      if (b.vision && b.vision.enabled === true && this.app.settings.contextTokens > 48000) {
-        // The projector needs VRAM. At a 75K context the twin T4s keep the KV
-        // cache and leave the projector nothing — the engine then dies of a
-        // CUDA out-of-memory. So: make room, and say so.
-        this.app.settings.contextTokens = 48000;
-        visionNote = "vision needs GPU memory — the context window was lowered to 48,000 tokens";
+      if (b.vision && b.vision.enabled === true && this.app.settings.contextTokens > 32000) {
+        // The projector warms up at the model's maximum image size and needs
+        // about 4.7 GB of GPU memory on top of the model and its KV cache. At
+        // 75K (or even 48K) the twin T4s have nothing left and llama.cpp
+        // aborts the whole engine. So: make room, and say so.
+        this.app.settings.contextTokens = 32000;
+        visionNote = "vision needs GPU memory — the context window was lowered to 32,000 tokens";
       }
       this.app.settings = mergeUser(this.app.settings, b);
-      if (visionNote) this.app.settings.contextTokens = 48000;
+      if (visionNote) this.app.settings.contextTokens = 32000;
       // Clamp skills through the settings module for safety.
       this.app.settings = { ...this.app.settings, skills: this.app.settings.skills ?? [] };
       this.persist("settings");
