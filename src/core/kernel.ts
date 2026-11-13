@@ -422,7 +422,12 @@ def ensure_deps():
                             "nvidia-cuda-runtime-cu12", "nvidia-cublas-cu12",
                             "nvidia-cuda-nvrtc-cu12", "nvidia-curand-cu12",
                             "nvidia-cusparse-cu12", "nvidia-cufft-cu12"], check=False)
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--timeout", "120", "--retries", "5",
+            # --upgrade matters: pip does NOT overwrite files that already
+            # exist in a --target directory, so a stale llama_cpp (from an
+            # earlier, broken install) would survive every install and the
+            # engine would keep finding a package without any chat handler.
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade",
+                            "--timeout", "120", "--retries", "5",
                             "--target", LIBS_DIR, "--no-deps", WHEEL], check=True)
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
                             "huggingface_hub"], check=True)
@@ -445,8 +450,10 @@ def ensure_deps():
             raise
     import huggingface_hub  # noqa
     if not (hasattr(llama_cpp, "MTMDChatHandler") or hasattr(llama_cpp, "Llava15ChatHandler")):
-        # A partial install leaves a llama_cpp without any chat handler.
-        slog({"ev": "err", "where": "deps", "d": "llama_cpp has no chat handler — reinstalling"})
+        # A partial (or stale) install leaves a llama_cpp without any handler.
+        slog({"ev": "err", "where": "deps", "d": "llama_cpp has no chat handler — reinstalling",
+              "path": str(getattr(llama_cpp, "__file__", "?")),
+              "version": str(getattr(llama_cpp, "__version__", "?"))})
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall",
                         "--timeout", "120", "--retries", "5",
                         "--target", LIBS_DIR, "--no-deps", WHEEL], check=False)
