@@ -665,18 +665,13 @@ def vision_ensure_loaded():
         return False
     if llm is None:
         return False
-    # The projector needs room on the GPU. A long context fills the T4s with
-    # the KV cache, and a CUDA out-of-memory there aborts the whole engine
-    # (it is a hard abort inside llama.cpp, not a Python error). So we check
-    # first and say what to do instead of taking the engine down with it.
+    # The projector runs on the CPU (see _mtmd_handler), so the GPU only has
+    # to have room for the model itself. Still worth checking: a GPU that is
+    # already full cannot even hold the model.
     free = free_vram_mb()
-    # The projector warms up at the model's maximum image size (1472x1472),
-    # which needs a ~4.7 GB buffer whatever image you send. So the room has
-    # to be there BEFORE the first picture, not after it.
-    if free >= 0 and free < 6000:
-        VISION["failed"] = ("not enough GPU memory for the vision projector ("
-                            + str(free) + " MB free, it needs about 6000 MB — lower the "
-                            "context window to 32,000 tokens and try again)")
+    if free >= 0 and free < 1500:
+        VISION["failed"] = ("not enough GPU memory left for the engine ("
+                            + str(free) + " MB free — lower the context window and try again)")
         slog({"ev": "vision-unavailable", "d": VISION["failed"]})
         return False
     # Candidates in order of fit for a Qwen3-VL style projector
