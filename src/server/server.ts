@@ -491,7 +491,16 @@ export class Server {
       const prevAfk = this.app.settings.afkMinutes;
       const prevVision = JSON.stringify(this.app.settings.vision);
       const prevMemTools = !!this.app.settings.memoryTools;
+      let visionNote = "";
+      if (b.vision && b.vision.enabled === true && this.app.settings.contextTokens > 48000) {
+        // The projector needs VRAM. At a 75K context the twin T4s keep the KV
+        // cache and leave the projector nothing — the engine then dies of a
+        // CUDA out-of-memory. So: make room, and say so.
+        this.app.settings.contextTokens = 48000;
+        visionNote = "vision needs GPU memory — the context window was lowered to 48,000 tokens";
+      }
       this.app.settings = mergeUser(this.app.settings, b);
+      if (visionNote) this.app.settings.contextTokens = 48000;
       // Clamp skills through the settings module for safety.
       this.app.settings = { ...this.app.settings, skills: this.app.settings.skills ?? [] };
       this.persist("settings");
@@ -509,7 +518,7 @@ export class Server {
           });
         }
       }
-      return this.json({ ok: true, settings: this.app.settings });
+      return this.json({ ok: true, settings: this.app.settings, note: visionNote || undefined });
     }
 
     // ---- tokens

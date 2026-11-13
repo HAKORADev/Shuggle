@@ -641,6 +641,18 @@ def _has_handlers():
     return False
 
 
+def free_vram_mb():
+    """Free VRAM across the GPUs, in MB."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, timeout=20)
+        vals = [int(x) for x in out.stdout.decode().split() if x.strip().isdigit()]
+        return sum(vals) if vals else -1
+    except Exception:
+        return -1
+
+
 def vision_ensure_loaded():
     """Load the multimodal projector on first use. No engine restart ever."""
     if VISION.get("handler"):
@@ -652,6 +664,16 @@ def vision_ensure_loaded():
         slog({"ev": "vision-unavailable", "d": VISION["failed"]})
         return False
     if llm is None:
+        return False
+    # The projector needs room on the GPU. A long context fills the T4s with
+    # the KV cache, and a CUDA out-of-memory there aborts the whole engine
+    # (it is a hard abort inside llama.cpp, not a Python error). So we check
+    # first and say what to do instead of taking the engine down with it.
+    free = free_vram_mb()
+    if free >= 0 and free < 4000:
+        VISION["failed"] = ("not enough GPU memory for the vision projector ("
+                            + str(free) + " MB free — lower the context window to about 48K and try again)")
+        slog({"ev": "vision-unavailable", "d": VISION["failed"]})
         return False
     # Candidates in order of fit for a Qwen3-VL style projector
     # (clip.projector_type = qwen3vl_merger):
