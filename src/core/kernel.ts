@@ -396,12 +396,20 @@ def ensure_deps():
     except ImportError:
         pass
     slog({"ev": "meta", "phase": "installing-deps"})
+    # The wheel is PINNED to the CUDA 12.1 build. Asking pip for
+    # "llama-cpp-python" with the cu121 index as an extra index makes pip pick
+    # the highest version it can find — the PyPI build, which needs CUDA 12 —
+    # and Kaggle's image only ships CUDA 11. So: take the cu121 wheel by URL,
+    # without dependencies, and the Python dependencies from PyPI.
+    WHEEL = ("https://github.com/abetlen/llama-cpp-python/releases/download/"
+             "v0.3.36-cu121/llama_cpp_python-0.3.36-py3-none-manylinux_2_35_x86_64.whl")
     for attempt in range(2):
         try:
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "pip"], check=False)
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
-                            "llama-cpp-python",
-                            "--extra-index-url", "https://abetlen.github.io/llama-cpp-python/whl/cu121"], check=True)
+                            "numpy", "typing-extensions", "diskcache", "jinja2"], check=True)
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
+                            "--no-deps", WHEEL], check=True)
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
                             "huggingface_hub"], check=True)
             if LIBS_DIR not in sys.path:
