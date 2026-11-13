@@ -37,7 +37,33 @@ cd "$ROOT"
 ls -la dist/*.zip
 
 echo "• creating the release $TAG on $REPO"
-existing="$(curl -s -H "Authorization: token $TOKEN" "$API/releases/tags/$TAG")"
+
+# The GitHub API is not always in the mood; retry instead of failing a build.
+api_get() {
+  local url="$1" out="" i
+  for i in 1 2 3 4 5; do
+    out="$(curl -s --max-time 60 -H "Authorization: token $TOKEN" "$url")"
+    case "$out" in
+      *"Bad credentials"*|""message":"Internal"*|""message":"Unavailable"*) sleep $((i * 2));;
+      *) echo "$out"; return 0;;
+    esac
+  done
+  echo "$out"
+}
+
+api_post() {
+  local url="$1" body="$2" out="" i
+  for i in 1 2 3 4 5; do
+    out="$(curl -s --max-time 120 -X POST -H "Authorization: token $TOKEN" -H "Accept: application/vnd.github+json" "$url" -d "$body")"
+    case "$out" in
+      *"Bad credentials"*|""message":"Internal"*|""message":"Unavailable"*) sleep $((i * 2));;
+      *) echo "$out"; return 0;;
+    esac
+  done
+  echo "$out"
+}
+
+existing="$(api_get "$API/releases/tags/$TAG")"
 release_id="$(echo "$existing" | python3 -c "
 import sys, json
 try:
@@ -60,8 +86,7 @@ print(' '.join(str(a['id']) for a in (j.get('assets') or [])))
     curl -s -X DELETE -H "Authorization: token $TOKEN" "$API/releases/assets/$aid" >/dev/null
   done
 else
-  release_id="$(curl -s -X POST -H "Authorization: token $TOKEN" -H "Accept: application/vnd.github+json" \
-    "$API/releases" -d "$(python3 - "$TAG" <<'PY'
+  release_id="$(api_post "$API/releases" "$(python3 - "$TAG" <<'PY'
 import json, sys
 tag = sys.argv[1]
 print(json.dumps({
@@ -76,7 +101,18 @@ print(json.dumps({
     "prerelease": True,
 }))
 PY
-)" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")"
+)" | python3 -c "
+import sys, json
+try:
+    j = json.load(sys.stdin)
+except Exception as e:
+    print(''); raise SystemExit(0)
+print(j.get('id', '') if isinstance(j, dict) else '')
+")"
+  if [ -z "$release_id" ]; then
+    echo "  could not create the release — the GitHub API did not answer"
+    exit 1
+  fi
   echo "  created release $release_id"
 fi
 
