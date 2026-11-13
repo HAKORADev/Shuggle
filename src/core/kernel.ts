@@ -367,6 +367,10 @@ def preload_cuda():
     libs = []
     for d in sorted(glob.glob(os.path.join(LIBS_DIR, "nvidia", "*", "lib"))):
         libs.extend(sorted(glob.glob(os.path.join(d, "*.so*"))))
+    # the image may carry its own CUDA runtime
+    for d in sorted(glob.glob("/usr/local/cuda*/lib64")):
+        libs.extend(sorted(glob.glob(os.path.join(d, "libcudart.so*"))))
+        libs.extend(sorted(glob.glob(os.path.join(d, "libcublas*.so*"))))
     # the runtime first — everything else may depend on it
     libs.sort(key=lambda p: (0 if "cudart" in os.path.basename(p) else 1, p))
     loaded = 0
@@ -378,8 +382,8 @@ def preload_cuda():
             loaded += 1
         except Exception:
             pass
-    if loaded:
-        slog({"ev": "meta", "phase": "cuda-preloaded", "detail": str(loaded)})
+    slog({"ev": "meta", "phase": "cuda-preloaded", "detail": str(loaded),
+          "cudart": next((os.path.basename(p) for p in libs if "cudart" in p), "none")})
 
 
 def ensure_deps():
@@ -408,6 +412,12 @@ def ensure_deps():
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "pip"], check=False)
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
                             "numpy", "typing-extensions", "diskcache", "jinja2"], check=True)
+            # The CUDA runtime the wheel expects does not always live on the
+            # image — take it from PyPI (nvidia's own redistributable wheels).
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
+                            "nvidia-cuda-runtime-cu12", "nvidia-cublas-cu12",
+                            "nvidia-cuda-nvrtc-cu12", "nvidia-curand-cu12",
+                            "nvidia-cusparse-cu12", "nvidia-cufft-cu12"], check=False)
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
                             "--no-deps", WHEEL], check=True)
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
