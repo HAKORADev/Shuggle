@@ -449,7 +449,7 @@ def ensure_deps():
         else:
             raise
     import huggingface_hub  # noqa
-    if not (hasattr(llama_cpp, "MTMDChatHandler") or hasattr(llama_cpp, "Llava15ChatHandler")):
+    if not _has_handlers():
         # A partial (or stale) install leaves a llama_cpp without any handler.
         slog({"ev": "err", "where": "deps", "d": "llama_cpp has no chat handler — reinstalling",
               "path": str(getattr(llama_cpp, "__file__", "?")),
@@ -593,16 +593,52 @@ def vision_check_ready():
     VISION["mmproj"] = p
     return True
 
-def _cls_handler(path, cls_name):
+def _chat_handlers():
+    """Where the chat handlers live.
+
+    Older llama-cpp-python re-exported them from the package root. From
+    0.3.3x on, __init__.py only does "from .llama import *" — the handlers
+    live in llama_cpp.llama_chat_format and have to be asked for there.
+    """
     import llama_cpp
-    cls = getattr(llama_cpp, cls_name)
+    mod = getattr(llama_cpp, "llama_chat_format", None)
+    if mod is None:
+        try:
+            import llama_cpp.llama_chat_format as mod  # noqa
+        except Exception:
+            mod = None
+    return llama_cpp, mod
+
+
+def _cls_handler(path, cls_name):
+    llama_cpp, mod = _chat_handlers()
+    cls = getattr(llama_cpp, cls_name, None)
+    if cls is None and mod is not None:
+        cls = getattr(mod, cls_name, None)
+    if cls is None:
+        raise AttributeError(cls_name + " is not in this llama-cpp-python build")
     return cls(path)
 
 
 def _mtmd_handler(path):
-    import llama_cpp
-    cls = getattr(llama_cpp, "MTMDChatHandler")
+    llama_cpp, mod = _chat_handlers()
+    cls = getattr(llama_cpp, "MTMDChatHandler", None)
+    if cls is None and mod is not None:
+        cls = getattr(mod, "MTMDChatHandler", None)
+    if cls is None:
+        raise AttributeError("MTMDChatHandler is not in this llama-cpp-python build")
     return cls(path, verbose=False)
+
+
+def _has_handlers():
+    try:
+        llama_cpp, mod = _chat_handlers()
+        for name in ("MTMDChatHandler", "Llava15ChatHandler"):
+            if hasattr(llama_cpp, name) or (mod is not None and hasattr(mod, name)):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def vision_ensure_loaded():
