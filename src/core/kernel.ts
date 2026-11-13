@@ -286,13 +286,13 @@ def read_cmd():
         cmd = json.loads(raw.decode())
         if not isinstance(cmd, dict):
             return None
-        # run_id gate: commands from OTHER app runs (stale CDN reads of old
-        # inbox versions are a real, observed thing) are ignored entirely -
-        # they must never advance the command cursor or dispatch anything.
-        if cmd.get("run_id") != CFG.get("runId", ""):
-            if cmd.get("type"):
-                err("inbox-stale", "ignoring command from another app run (v=" + str(cmd.get("v")) + ")")
-            return None
+        # Freshness is decided by the command counter, not by who wrote it:
+        # a command from another app run is normal (the app restarted, or a
+        # second window is talking to the same engine) and must still work.
+        # A stale read from the CDN carries an OLDER v, and that is what the
+        # counter check below rejects.
+        if cmd.get("run_id") and cmd.get("run_id") != CFG.get("runId", ""):
+            slog({"ev": "inbox-run", "v": cmd.get("v"), "from": cmd.get("run_id")})
         if cmd.get("v", 0) <= SEEN_V:
             return None
         return cmd
