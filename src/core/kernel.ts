@@ -367,10 +367,9 @@ def preload_cuda():
     libs = []
     for d in sorted(glob.glob(os.path.join(LIBS_DIR, "nvidia", "*", "lib"))):
         libs.extend(sorted(glob.glob(os.path.join(d, "*.so*"))))
-    # the image may carry its own CUDA runtime
-    for d in sorted(glob.glob("/usr/local/cuda*/lib64")):
-        libs.extend(sorted(glob.glob(os.path.join(d, "libcudart.so*"))))
-        libs.extend(sorted(glob.glob(os.path.join(d, "libcublas*.so*"))))
+    for d in sorted(glob.glob(os.path.join(LIBS_DIR, "llama_cpp_python.libs"))):
+        libs.extend(sorted(glob.glob(os.path.join(d, "*.so*"))))
+    # the wheel's own bundled libraries first (they are the right build)
     # the runtime first — everything else may depend on it
     libs.sort(key=lambda p: (0 if "cudart" in os.path.basename(p) else 1, p))
     loaded = 0
@@ -407,19 +406,16 @@ def ensure_deps():
     # without dependencies, and the Python dependencies from PyPI.
     WHEEL = ("https://github.com/abetlen/llama-cpp-python/releases/download/"
              "v0.3.36-cu121/llama_cpp_python-0.3.36-py3-none-manylinux_2_35_x86_64.whl")
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "pip"], check=False)
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--timeout", "120", "--retries", "5",
+                            "--target", LIBS_DIR,
                             "numpy", "typing-extensions", "diskcache", "jinja2"], check=True)
-            # The CUDA runtime the wheel expects does not always live on the
-            # image — take it from PyPI (nvidia's own redistributable wheels).
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
-                            "nvidia-cuda-runtime-cu12", "nvidia-cublas-cu12",
-                            "nvidia-cuda-nvrtc-cu12", "nvidia-curand-cu12",
-                            "nvidia-cusparse-cu12", "nvidia-cufft-cu12"], check=False)
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
-                            "--no-deps", WHEEL], check=True)
+            # The CUDA wheel carries its own CUDA libraries (1.8 GB), so nothing
+            # else is needed. It is a big download: give it time and retries.
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--timeout", "120", "--retries", "5",
+                            "--target", LIBS_DIR, "--no-deps", WHEEL], check=True)
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", LIBS_DIR,
                             "huggingface_hub"], check=True)
             if LIBS_DIR not in sys.path:
@@ -429,8 +425,25 @@ def ensure_deps():
             err("deps", e)
             time.sleep(5)
     preload_cuda()
-    import llama_cpp  # noqa
+    try:
+        import llama_cpp  # noqa
+    except OSError as e:
+        # "libcudart.so.12: cannot open shared object file" — the bundled
+        # libraries are not reachable; preload the runtime and try once more.
+        if "cannot open shared object file" in str(e):
+            preload_cuda()
+            import llama_cpp  # noqa
+        else:
+            raise
     import huggingface_hub  # noqa
+    if not (hasattr(llama_cpp, "MTMDChatHandler") or hasattr(llama_cpp, "Llava15ChatHandler")):
+        # A partial install leaves a llama_cpp without any chat handler.
+        slog({"ev": "err", "where": "deps", "d": "llama_cpp has no chat handler — reinstalling"})
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall",
+                        "--timeout", "120", "--retries", "5",
+                        "--target", LIBS_DIR, "--no-deps", WHEEL], check=False)
+        preload_cuda()
+        import llama_cpp  # noqa
 
 def find_file(prefix, suffix):
     for root in (WORK, "/kaggle/input"):
