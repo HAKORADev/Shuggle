@@ -458,8 +458,13 @@ export class EngineSlot {
             this.stopTimers();
             return;
           }
-          // Zombie watch: a session we SAW producing output went silent.
-          if (st.status === "RUNNING" && !this.awaitingFreshBoot && this.lastSseAt > 0 && Date.now() - this.lastSseAt > 8 * 60_000 && this.state !== "generating") {
+          // Zombie watch: a session that went quiet for minutes. A kernel can
+          // sit RUNNING while it is QUEUED for a GPU and never say a word —
+          // so this must NOT wait for the "fresh boot" flag, which only clears
+          // when the kernel speaks up. Twelve minutes of silence (even with
+          // no boot event at all) means it is not coming.
+          const lastNews = Math.max(this.lastSseAt, this.pushedAt);
+          if (st.status === "RUNNING" && lastNews > 0 && Date.now() - lastNews > 12 * 60_000 && this.state !== "generating") {
             this.recovering = true;
             this.setState("booting", "Clearing a stuck engine session");
             this.stopTimers();
