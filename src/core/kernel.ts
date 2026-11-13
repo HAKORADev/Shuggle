@@ -627,7 +627,19 @@ def _mtmd_handler(path):
         cls = getattr(mod, "MTMDChatHandler", None)
     if cls is None:
         raise AttributeError("MTMDChatHandler is not in this llama-cpp-python build")
-    return cls(path, verbose=False)
+    handler = cls(path, verbose=False)
+    # The projector warms up at the model's maximum image size and wants a
+    # ~4.7 GB buffer on the GPU — and the model plus its KV cache have already
+    # filled the twin T4s, so llama.cpp aborted the whole engine with a CUDA
+    # out-of-memory. The projector does not need the GPU: it runs once per
+    # picture, and on the CPU it takes a couple of seconds instead of taking
+    # the whole session down with it.
+    try:
+        if hasattr(handler, "use_gpu"):
+            handler.use_gpu = False
+    except Exception:
+        pass
+    return handler
 
 
 def _has_handlers():
