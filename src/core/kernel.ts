@@ -354,11 +354,40 @@ LAST_DONE = None        # last finished reply — the sleeping outbox carries it
 LAST_CMD_V = 0          # version of the command being processed — tags every
                         # generation event so the app can drop stale replays
 
+def preload_cuda():
+    """Make the bundled CUDA libraries findable.
+
+    llama-cpp-python's CUDA wheel pulls the nvidia runtime packages into
+    LIBS_DIR/nvidia/*/lib, but the dynamic linker does not look there: it
+    only reads LD_LIBRARY_PATH once, at process start. Preloading them with
+    RTLD_GLOBAL puts them in the global namespace, so libllama.so finds
+    libcudart.so.12 when it is loaded a moment later.
+    """
+    import ctypes
+    libs = []
+    for d in sorted(glob.glob(os.path.join(LIBS_DIR, "nvidia", "*", "lib"))):
+        libs.extend(sorted(glob.glob(os.path.join(d, "*.so*"))))
+    # the runtime first — everything else may depend on it
+    libs.sort(key=lambda p: (0 if "cudart" in os.path.basename(p) else 1, p))
+    loaded = 0
+    for p in libs:
+        if os.path.islink(p) and not os.path.exists(p):
+            continue
+        try:
+            ctypes.CDLL(p, mode=ctypes.RTLD_GLOBAL)
+            loaded += 1
+        except Exception:
+            pass
+    if loaded:
+        slog({"ev": "meta", "phase": "cuda-preloaded", "detail": str(loaded)})
+
+
 def ensure_deps():
     global llm
     # Persistent install: later boots skip pip entirely (unqwen pattern).
     if os.path.isdir(LIBS_DIR) and LIBS_DIR not in sys.path:
         sys.path.insert(0, LIBS_DIR)
+    preload_cuda()
     try:
         import llama_cpp  # noqa
         import huggingface_hub  # noqa
@@ -381,6 +410,7 @@ def ensure_deps():
         except Exception as e:
             err("deps", e)
             time.sleep(5)
+    preload_cuda()
     import llama_cpp  # noqa
     import huggingface_hub  # noqa
 
