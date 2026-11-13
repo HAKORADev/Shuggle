@@ -1141,6 +1141,7 @@ export class Server {
         type = "text/css; charset=utf-8";
         break;
       case "/favicon.svg":
+      case "/favicon.png": // old links — same mark, correct type
         return new Response(faviconSvg, { headers: { "Content-Type": "image/svg+xml" } });
       default:
         body = indexHtml;

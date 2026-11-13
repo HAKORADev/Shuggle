@@ -13,6 +13,21 @@ import { profileNamespace } from "../src/core/engine.ts";
 import { engineScript } from "../src/core/kernel.ts";
 import { hsh16 } from "../src/core/util.ts";
 
+
+/** The python on this machine — Windows says "python", Linux "python3". */
+function pythonCommand(): string | null {
+  const { spawnSync } = require("node:child_process");
+  for (const c of ["python3", "python"]) {
+    try {
+      const r = spawnSync(c, ["--version"], { stdio: "pipe" });
+      if (r.status === 0) return c;
+    } catch {
+      /* try the next one */
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- skills ---
 
 test("skills: defaults survive sanitising", () => {
@@ -242,9 +257,12 @@ test("engine script: the generated Python compiles", async () => {
   expect(src.length).toBeGreaterThan(1000);
   expect(src).toContain("KGAT_test");
   expect(src).not.toContain("__CONFIG__");
-  // The script must be syntactically valid Python.
+  // The script must be syntactically valid Python. (Windows runners call it
+  // "python", Linux "python3" — and a machine without python skips it.)
   const { spawnSync } = await import("node:child_process");
-  const r = spawnSync("python3", ["-c", "import sys;compile(sys.stdin.read(),'engine.py','exec')"], { input: src, encoding: "utf8" });
+  const py = pythonCommand();
+  if (!py) return;
+  const r = spawnSync(py, ["-c", "import sys;compile(sys.stdin.read(),'engine.py','exec')"], { input: src, encoding: "utf8" });
   expect(r.stderr).toBe("");
   expect(r.status).toBe(0);
 });

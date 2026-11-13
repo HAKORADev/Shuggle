@@ -85,6 +85,25 @@ Launchers do the same thing without typing: `Shuggle.bat`, `Shuggle CLI.bat`, `S
 
 Interactive commands: `/new /open /list /rename /del /pin /search /think /memory /tokens /use /status /sleep /help`
 
+## Build It Yourself
+
+The binaries are built from source with [Bun](https://bun.sh) — no Actions, no CI account, no mystery.
+
+```bash
+npm i -g bun          # the toolchain
+bun run build         # → one executable, ~105 MB (the Bun runtime inside)
+bun test tests/core.test.ts tests/engine.test.ts     # 44 unit tests
+bun run test:ui       # drives the real app in a real browser (20 checks)
+```
+
+`scripts/build-release.sh` builds both platforms and compresses them with UPX (~105 MB → ~35 MB):
+
+```bash
+./scripts/build-release.sh     # dist/Shuggle-linux-x64/ + dist/Shuggle-windows-x64/
+```
+
+The Windows executable is cross-compiled from Linux — Bun compiles it, and `scripts/windows_resources.py` injects the icon and the version info into the PE, because Bun can only embed an icon when it compiles *on* Windows. The binary keeps the **console subsystem** on purpose: the CLI verbs (`cli`, `chat`, `tokens`) must print to your terminal, and the window mode hides the console at runtime instead, so no black box sits behind the app.
+
 ## Share On Your Network
 
 Run **`Shuggle LAN.bat`** (Windows) or **`./shuggle-lan.sh`** (Linux) — Shuggle opens to your local network and prints a link like `http://192.168.1.20:8680`. Anyone on the same Wi-Fi opens it in a browser, logs in with your password, and chats. Everything still runs and stays on your machine.

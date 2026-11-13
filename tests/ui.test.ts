@@ -14,6 +14,9 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 
 const ROOT = new URL("..", import.meta.url).pathname;
+// SHUGGLE_BIN lets the same test run against a release artifact instead of
+// the development build.
+const BIN = process.env.SHUGGLE_BIN || join(ROOT, "shuggle");
 const dataDir = mkdtempSync(join(tmpdir(), "shuggle-ui-"));
 const PORT = 8799 + Math.floor(Math.random() * 40);
 
@@ -23,7 +26,7 @@ function check(name: string, ok: boolean, detail = ""): void {
   console.log(`${ok ? "  ok  " : " FAIL "} ${name}${detail ? " — " + detail : ""}`);
 }
 
-const app = spawn(join(ROOT, "shuggle"), [`--data=${dataDir}`, "serve", `--port=${PORT}`], {
+const app = spawn(BIN, [`--data=${dataDir}`, "serve", `--port=${PORT}`], {
   cwd: ROOT,
   stdio: ["ignore", "pipe", "pipe"],
 });

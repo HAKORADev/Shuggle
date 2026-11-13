@@ -59,9 +59,13 @@ jobs:
           bun-version: latest
       - name: Bundle UI
         run: bun build src/ui/app.ts --minify --format=iife --outfile=src/ui/app.bundle.js
+      # Console subsystem ON PURPOSE: the CLI verbs (cli / chat / tokens /
+      # status) must print to the terminal. The window mode hides the console
+      # at runtime instead (hideWindowsConsole), so there is no cmd box behind
+      # the app. A GUI-subsystem binary would make the CLI silently dead.
       - name: Compile single binary
         shell: bash
-        run: bun build src/shuggle.ts --compile --windows-icon=assets/shuggle.ico --windows-hide-console --windows-title="Shuggle" --windows-publisher="HAKORA" --windows-version="0.5.0.0" --windows-description="Free chats on free GPUs" --outfile=Shuggle.exe
+        run: bun build src/shuggle.ts --compile --windows-icon=assets/shuggle.ico --windows-title="Shuggle" --windows-publisher="HAKORA" --windows-version="0.5.0.0" --windows-description="Free chats on free GPUs" --outfile=Shuggle.exe
       - name: Smoke test (CLI + server + UI assets)
         shell: bash
         run: |

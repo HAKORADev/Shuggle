@@ -8,6 +8,20 @@ import { engineScript } from "../src/core/kernel.ts";
 import { hsh16 } from "../src/core/util.ts";
 import { execSync } from "node:child_process";
 
+
+/** The python on this machine — Windows says "python", Linux "python3". */
+function pythonCommand(): string | null {
+  for (const c of ["python3", "python"]) {
+    try {
+      const r = execSync(`${c} --version`, { stdio: "pipe" });
+      if (r.status === 0) return c;
+    } catch {
+      /* try the next one */
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- memory ----
 
 describe("memory", () => {
@@ -184,11 +198,14 @@ describe("kernel", () => {
   });
 
   test("generated python compiles (py_compile)", () => {
-    const s = engineScript(cfg);
-    const py = s.replace(/CFG = json.loads\(r'''.*?'''\)/s, "CFG = {}");
+    const src = engineScript(cfg);
+    const script = src.replace(/CFG = json.loads\(r'''.*?'''\)/s, "CFG = {}");
     const { writeFileSync } = require("node:fs");
-    writeFileSync("/tmp/shuggle_engine_test.py", py);
-    execSync("python3 -m py_compile /tmp/shuggle_engine_test.py", { stdio: "pipe" });
+    const out = process.platform === "win32" ? "shuggle_engine_test.py" : "/tmp/shuggle_engine_test.py";
+    writeFileSync(out, script);
+    const py = pythonCommand();
+    if (!py) return; // no python on this machine (the check runs elsewhere)
+    execSync(`${py} -m py_compile "${out}"`, { stdio: "pipe" });
   });
 
   test("hash parity with the engine's python hsh() on tricky payloads", () => {
@@ -199,9 +216,11 @@ describe("kernel", () => {
       [{ role: "user", content: "emoji 🚀 + \t\ttabs" }],
       [],
     ];
+    const pyBin = pythonCommand();
+    if (!pyBin) return; // no python on this machine (the check runs elsewhere)
     for (const c of cases) {
       const expected = execSync(
-        `python3 -c "import hashlib,json,sys; print(hashlib.sha256(json.dumps(json.loads(sys.stdin.read()), sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16])"`,
+        `${pyBin} -c "import hashlib,json,sys; print(hashlib.sha256(json.dumps(json.loads(sys.stdin.read()), sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16])"`,
         { input: JSON.stringify(c) },
       ).toString().trim();
       expect(hsh16(c)).toBe(expected);
