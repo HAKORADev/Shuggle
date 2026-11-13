@@ -9,3 +9,6 @@ ShuggleData/
 app.bundle.js
 shuggle-test
 dist/
+
+# NFS temp files: a compiler that writes-then-renames leaves these behind
+.nfs*
