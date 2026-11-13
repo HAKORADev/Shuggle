@@ -103,6 +103,18 @@ curl -sf -o /dev/null http://127.0.0.1:$PORT/api/health && echo "  ok   api/heal
 kill $SRV 2>/dev/null || true
 [ $fail -eq 0 ] || { echo "smoke test failed"; exit 1; }
 
+# ------------------------------------------------------------------ parts ---
+# Some connections die on a 100 MB download. The binaries are also offered in
+# ~25 MB parts; the launchers join them on the first run.
+echo "• splitting the binaries into parts"
+split_parts() {
+  local bin="$1" prefix="$2" size="${3:-25}"
+  [ -f "$bin" ] || return 0
+  split -b "${size}M" -d -a 2 "$bin" "${prefix}.part"
+}
+split_parts "$BUILD/Shuggle-linux-x64/shuggle" "$BUILD/Shuggle-linux-x64/shuggle"
+split_parts "$BUILD/Shuggle-windows-x64/Shuggle.exe" "$BUILD/Shuggle-windows-x64/Shuggle.exe"
+
 # ------------------------------------------------------------------ stage ---
 mkdir -p "$DIST"
 rm -rf "$DIST/Shuggle-linux-x64" "$DIST/Shuggle-windows-x64" 2>/dev/null || true

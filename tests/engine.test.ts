@@ -185,7 +185,8 @@ describe("sysprompt", () => {
 
 describe("kernel", () => {
   const cfg = {
-    bearer: "KGAT_x", owner: "hakoradev", profile: "HAKORA", contextTokens: 75000, afkSeconds: 180,
+    bearer: "KGAT_x", owner: "hakoradev", profile: "HAKORA", ns: "hakora-ecbd9b33d57d5b32",
+    contextTokens: 75000, afkSeconds: 180,
     memoryTools: true, vision: { enabled: true, maxFrames: 8, frameSeconds: 2, mediaTokenBudget: 8000 },
   };
 
@@ -225,5 +226,36 @@ describe("kernel", () => {
       ).toString().trim();
       expect(hsh16(c)).toBe(expected);
     }
+  });
+});
+
+// --------------------------------------------------------------- the relay ---
+
+describe("the relay", () => {
+  const cfg = {
+    bearer: "KGAT_x", owner: "hakoradev", profile: "HAKORA", ns: "hakora-ecbd9b33d57d5b32",
+    contextTokens: 75000, afkSeconds: 180,
+    memoryTools: true, vision: { enabled: true, maxFrames: 8, frameSeconds: 2, mediaTokenBudget: 8000 },
+  };
+
+  test("the engine and the app name the relay datasets the same way", () => {
+    // The app writes to shuggle-inbox-g2-<ns> / outbox-g2-<ns> / store-<ns>.
+    // If the engine computes a DIFFERENT name (a truncation, a prefix that
+    // only exists on one side) the relay goes quiet and no reply ever comes
+    // back — a silent, total failure.
+    const src = engineScript(cfg);
+    expect(src).toContain('STORE_SLUG = "shuggle-store-" + NS');
+    expect(src).toContain('INBOX_SLUG = "shuggle-inbox-g2-" + NS');
+    expect(src).toContain('OUTBOX_SLUG = "shuggle-outbox-g2-" + NS');
+    // no truncation of the namespace on the engine side
+    expect(src).not.toMatch(/NS = str\(NS\)\[:/);
+    expect(src).not.toMatch(/NS\[:\d+\]/);
+  });
+
+  test("the engine is told the exact namespace the app uses", () => {
+    const ns = "hakoradev-ecbd9b33d57d5b32";
+    const src = engineScript({ ...cfg, ns });
+    expect(src).toContain(`"ns":"${ns}"`);
+    expect(src).toContain('NS = CFG.get("ns")');
   });
 });

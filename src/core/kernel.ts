@@ -97,7 +97,10 @@ def _slugns(name):
 NS = CFG.get("ns")
 if not NS:
     NS = _slugns(PROFILE)
-NS = str(NS)[:20]
+# NO truncation here — the app builds the same slug from the same namespace.
+# Truncating on one side only means the engine reads a different dataset than
+# the app writes to, and the relay goes quiet.
+NS = str(NS)
 STORE_SLUG = "shuggle-store-" + NS
 INBOX_SLUG = "shuggle-inbox-g2-" + NS
 OUTBOX_SLUG = "shuggle-outbox-g2-" + NS
@@ -156,6 +159,14 @@ def slog(m):
 def err(where, d):
     slog({"ev": "err", "where": where, "d": str(d)[:300]})
 
+def http_detail(e):
+    """The server's own words — a bare 403 says nothing about WHY."""
+    try:
+        body = e.read()[:220].decode("utf-8", "replace")
+    except Exception:
+        body = ""
+    return str(e)[:120] + (" | " + body if body else "")
+
 def rpc(method, body, timeout=120):
     req = urllib.request.Request(
         BASE + "/" + method,
@@ -166,7 +177,7 @@ def rpc(method, body, timeout=120):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
-def _download_bytes(owner, slug, file_name, timeout=120):
+def _download_once(owner, slug, file_name, timeout=120):
     req = urllib.request.Request(
         BASE + "/datasets.DatasetApiService/DownloadDataset",
         data=json.dumps({"ownerSlug": owner, "datasetSlug": slug, "fileName": file_name, "raw": True}).encode(),
@@ -185,6 +196,33 @@ def _download_bytes(owner, slug, file_name, timeout=120):
             with urllib.request.urlopen(e.headers["Location"], timeout=timeout) as r2:
                 return r2.read()
         raise
+
+
+def _download_bytes(owner, slug, file_name, timeout=120, retries=4):
+    """Fetch a dataset file.
+
+    Kaggle answers a missing file (or a dataset version that has not
+    propagated yet) with 403 and a bare "Permission denied" — the same shape
+    as a real permission problem. So we retry those too: a relay that gives up
+    on the first 403 is a relay that never answers.
+    """
+    last = None
+    for attempt in range(retries):
+        try:
+            return _download_once(owner, slug, file_name, timeout)
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.status in (403, 404, 429, 500, 502, 503, 504) and attempt < retries - 1:
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise
+        except Exception as e:
+            last = e
+            if attempt < retries - 1:
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise
+    raise last
 
 def hsh(obj):
     return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
@@ -207,7 +245,7 @@ def load_store():
             }
         slog({"ev": "meta", "phase": "store-loaded", "sessions": len(STORE["sessions"])})
     except Exception as e:
-        err("store-load", e)
+        err("store-load", http_detail(e))
 
 def save_store(retries=2):
     try:
@@ -279,7 +317,7 @@ def fetch_media(file_name):
         err("media-fetch", file_name + ": " + str(e))
         return None
 
-def outbox_push(state):
+def outbox_push(state, attempt=0):
     try:
         content = json.dumps(state, ensure_ascii=False).encode()
         j = rpc("blobs.BlobApiService/StartBlobUpload", {
@@ -296,11 +334,17 @@ def outbox_push(state):
                      "subtitle": "Shuggle outbox",
                      "description": "Shuggle engine responses. Managed automatically.",
                      "categoryIds": [], "versionNotes": "t" + str(int(time.time()))}}, 300)
+    except urllib.error.HTTPError as e:
+        if attempt < 3 and e.code in (403, 429, 500, 502, 503, 504):
+            time.sleep(4 * (attempt + 1))
+            return outbox_push(state, attempt + 1)
+        err("outbox", http_detail(e))
     except Exception as e:
-        err("outbox", e)
+        err("outbox", str(e)[:300])
 
 # ----------------------------------------------------------------- boot ----
-slog({"ev": "meta", "phase": "booting", "engine": "__ENGINE_VERSION__", "profile": PROFILE})
+slog({"ev": "meta", "phase": "booting", "engine": "__ENGINE_VERSION__", "profile": PROFILE,
+      "ns": NS, "inbox": INBOX_SLUG, "outbox": OUTBOX_SLUG, "store": STORE_SLUG})
 
 llm = None
 VISION = {"handler": None, "mmproj": None, "name": None, "failed": None}

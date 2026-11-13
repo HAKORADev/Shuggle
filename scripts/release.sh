@@ -30,18 +30,33 @@ cd "$ROOT/dist"
 rm -f ./*.zip
 for d in Shuggle-linux-x64 Shuggle-windows-x64; do
   [ -d "$d" ] || continue
-  ( cd "$d" && zip -qr "../$d.zip" . )
+  # the split parts are uploaded on their own — no need inside the zip
+  ( cd "$d" && zip -qr "../$d.zip" . -x "*.part*" )
 done
 cd "$ROOT"
 ls -la dist/*.zip
 
 echo "• creating the release $TAG on $REPO"
-existing="$(curl -s -H "Authorization: token $TOKEN" "$API/releases/tags/$TAG" | head -c 200)"
-release_id=""
-if echo "$existing" | grep -q '"id"'; then
-  release_id="$(echo "$existing" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")"
+existing="$(curl -s -H "Authorization: token $TOKEN" "$API/releases/tags/$TAG")"
+release_id="$(echo "$existing" | python3 -c "
+import sys, json
+try:
+    j = json.load(sys.stdin)
+except Exception:
+    print('')
+    raise SystemExit(0)
+print(j.get('id', '') if isinstance(j, dict) else '')
+")"
+if [ -n "$release_id" ]; then
   echo "  release exists ($release_id) — replacing the assets"
-  for aid in $(echo "$existing" | python3 -c "import sys,json;print(' '.join(str(a['id']) for a in json.load(sys.stdin).get('assets',[])))"); do
+  for aid in $(echo "$existing" | python3 -c "
+import sys, json
+try:
+    j = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+print(' '.join(str(a['id']) for a in (j.get('assets') or [])))
+"); do
     curl -s -X DELETE -H "Authorization: token $TOKEN" "$API/releases/assets/$aid" >/dev/null
   done
 else
@@ -65,8 +80,12 @@ PY
   echo "  created release $release_id"
 fi
 
+echo "• packing the launchers (for the parts-only download)"
+( cd dist/Shuggle-windows-x64 2>/dev/null && zip -qr ../Shuggle-launchers.zip . -x "*.part*" "*.exe" ) || true
+( cd dist/Shuggle-linux-x64 2>/dev/null && zip -qr ../Shuggle-launchers-linux.zip . -x "*.part*" "shuggle" ) || true
+
 echo "• uploading"
-for f in dist/*.zip dist/SHA256SUMS.txt; do
+for f in dist/*.zip dist/SHA256SUMS.txt dist/*/*.part*; do
   [ -f "$f" ] || continue
   name="$(basename "$f")"
   echo "  $name"
